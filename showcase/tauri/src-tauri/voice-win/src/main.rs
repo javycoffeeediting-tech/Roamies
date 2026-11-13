@@ -14,6 +14,8 @@
 // With "send when I pause" on ({"cmd":"pause_sends"}), a held take also sends once the talking stops.
 // End words ({"cmd":"end_words","words":["over","go"]}): one said last sends the take at once, without it.
 // Cancel words ({"cmd":"cancel_words","words":["cancel","never mind"]}): one said last drops the whole take, nothing sent.
+// {"cmd":"wake_pause","on":true} pauses wake listening until the talk chord is pressed again ({"type":"wake_paused"}
+// tells the app either way), or until {"cmd":"wake_pause","on":false}.
 // {"cmd":"listen","quiet":3} listens hands-free and lets go after 3 s with nothing said (listening after a reply).
 //
 // roamies-voice --model <dir> [--chord control,option]   normal use (Roamies starts it)
@@ -217,6 +219,8 @@ struct Voice {
     cancel_words: Vec<Vec<String>>,
     // A hands-free take with nothing said ends after this long (shorter when listening after a reply).
     quiet_limit: f64,
+    // Wake listening paused by the user ("pause voice detection", or the tray menu); the talk chord resumes it.
+    wake_paused: bool,
 }
 
 impl Voice {
@@ -261,6 +265,7 @@ impl Voice {
             end_words: Vec::new(),
             ended_by_word: false,
             cancel_words: Vec::new(),
+            wake_paused: false,
             quiet_limit: NOTHING_HEARD,
         }
     }
@@ -326,6 +331,8 @@ impl Voice {
             Phase::Idle | Phase::Wake => {
                 if chord && !prev && !self.blocked {
                     self.stop_wake();
+                    // Paused voice detection comes back with the talk keys.
+                    self.set_wake_paused(false);
                     self.arm(now);
                 }
             }
@@ -635,6 +642,18 @@ impl Voice {
         }
     }
 
+    fn set_wake_paused(&mut self, on: bool) {
+        if on == self.wake_paused {
+            return;
+        }
+        self.wake_paused = on;
+        log(if on { "wake: paused by the user" } else { "wake: resumed by the user" });
+        if on {
+            self.stop_wake();
+        }
+        emit(json!({ "type": "wake_paused", "on": on }));
+    }
+
     fn set_wake_hold(&mut self, on: bool) {
         if on != self.wake_hold && self.wake_on {
             log(if on { "wake: paused while Roamies answers" } else { "wake: resumed" });
@@ -655,6 +674,7 @@ impl Voice {
     fn wake_allowed(&self, now: f64) -> bool {
         self.wake_on
             && !self.wake_hold
+            && !self.wake_paused
             && !self.wake_phrases.is_empty()
             && self.engine.is_some()
             && now >= self.wake_cooldown_until
@@ -819,6 +839,7 @@ impl Voice {
                     self.set_wake(msg.get("on").and_then(Value::as_bool) == Some(true), words);
                 }
                 Some("wake_hold") => self.set_wake_hold(msg.get("on").and_then(Value::as_bool) == Some(true)),
+                Some("wake_pause") => self.set_wake_paused(msg.get("on").and_then(Value::as_bool) == Some(true)),
                 Some("pause_sends") => self.pause_sends = msg.get("on").and_then(Value::as_bool) == Some(true),
                 // Muting the speakers while listening is macOS-only for now.
                 _ => {}
@@ -1057,6 +1078,25 @@ mod tests {
         v.set_wake(true, Some(vec!["   ".into()]));
         v.tick();
         assert_eq!(v.phase, Phase::Idle, "no phrases, nothing to listen for");
+        let _ = std::fs::remove_file(wav);
+    }
+
+    #[test]
+    fn paused_voice_detection_stays_off_until_resumed() {
+        let (mut v, _jobs, wav) = waiting(&["Hey Roamies"]);
+        v.handle(Ev::Cmd(json!({ "cmd": "wake_pause", "on": true })));
+        assert_eq!(v.phase, Phase::Idle, "the mic is off");
+        assert!(v.source.is_none());
+        v.wake_cooldown_until = 0.0;
+        v.tick();
+        assert_eq!(v.phase, Phase::Idle, "and stays off while paused");
+        v.handle(Ev::Cmd(json!({ "cmd": "wake_pause", "on": false })));
+        v.tick();
+        assert_eq!(v.phase, Phase::Wake, "resumed: listening for the phrase again");
+        // The talk keys resume it too (set_wake_paused is what the chord press calls).
+        v.handle(Ev::Cmd(json!({ "cmd": "wake_pause", "on": true })));
+        v.set_wake_paused(false);
+        assert!(!v.wake_paused);
         let _ = std::fs::remove_file(wav);
     }
 

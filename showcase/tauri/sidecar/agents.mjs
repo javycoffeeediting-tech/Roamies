@@ -378,6 +378,8 @@ export function createAgents({ fork, ui, config, root, userName = 'The user', ru
       if (a.turns > LIMITS.turns) stop(a.id, { state: 'failed', reason: `Used all its ${LIMITS.turns} turns` });
     } else if (m.t === 'plan') { p.event = now(); a.step = one(m.text, 60); update(a); }
     else if (m.t === 'ask') {
+      // Already allowed (Allow everything, or the same question allowed before): carry on without asking.
+      if (config.granted?.(one(m.question, 300))) { if (p.child.connected) p.child.send({ t: 'reply', id: m.id, value: true }); return; }
       if (a.state === 'working') { a.workMs += now() - a.workFrom; a.workFrom = null; }
       a.state = 'waiting'; a.told = false; a.ask = { id: m.id, question: one(m.question, 300) };
       tell('ask', a); saveState(a);
@@ -450,6 +452,7 @@ export function createAgents({ fork, ui, config, root, userName = 'The user', ru
   function answer(id, allow) {
     const a = agents.get(String(id)), p = procs.get(String(id));
     if (!a?.ask || !p) return false;
+    if (allow) config.grant?.(a.ask.question);
     p.child.send({ t: 'reply', id: a.ask.id, value: !!allow });
     resume(a);
     return true;

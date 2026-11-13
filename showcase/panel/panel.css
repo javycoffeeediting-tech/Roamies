@@ -112,7 +112,7 @@ html, body { height: 100%; background: transparent; }
 .maker > span small { display: block; font: 400 var(--t-small)/1.35 var(--mono); color: var(--ink-3); }
 
 /* ---------- sidebar: one page per concern ---------- */
-.split { flex: 1; min-height: 0; display: grid; grid-template-columns: var(--side) minmax(0, 1fr); border-top: 1px dashed var(--line); }
+.split { flex: 1; min-height: 0; display: grid; grid-template-columns: var(--side) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); border-top: 1px dashed var(--line); }
 :root { --side: 148px; }
 .side { display: flex; flex-direction: column; gap: 4px; padding: 12px 10px var(--gut); border-right: 1px dashed var(--line); overflow-y: auto; }
 .nav { margin: 0; padding: 0; list-style: none; display: grid; gap: 2px; }
@@ -134,9 +134,11 @@ html, body { height: 100%; background: transparent; }
 @keyframes navi-ping { 0% { filter: brightness(1.9); } 100% { filter: none; } }
 
 /* ---------- panes ---------- */
-/* Pages fit the window and never scroll: long lists show a page at a time with arrows in the page's footer. */
-.body { min-height: 0; overflow: hidden; padding: 4px var(--gut) 0; display: flex; flex-direction: column; }
+/* Long lists show a page at a time with arrows in the page's footer (.paged: they fit the window exactly). Other pages
+   (the settings) grow with their rows and the body scrolls when they're taller than the window. */
+.body { min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 4px var(--gut) 0; display: flex; flex-direction: column; }
 .pane { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; gap: var(--group); padding: 12px 0 var(--gut); }
+.pane:not(.paged) { flex: 1 0 auto; }
 .pane.paged { padding-bottom: 0; }
 .pane[hidden] { display: none; }
 /* A paged list takes the room left and shows as many rows as fit there (panel.js measures). */

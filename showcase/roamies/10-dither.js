@@ -1,5 +1,8 @@
 // Dither blobs: a shaded metaball pushed through an ordered-dither threshold into a small fixed palette.
 // Roamie.ditherKit(options) returns a roamie definition, so each variant only changes its look and extras.
+// Modern style (Roamie.style === 'modern'): the same picture without the stipple, scanlines or LED gaps, scaled up
+// through an edge-smoothing pixel-art scaler (Scale2x, two or three times) and a soft resample, so the characters,
+// the cursor and the globe read as smooth shapes rather than pixels.
 (() => {
   const bayer = (n) => {
     let M = [[0]];
@@ -30,7 +33,9 @@
       // The dither pattern is pinned to the screen, or to the body while it follows the cursor (tox, toy: its cell),
       // so the shading doesn't crawl across it as it moves.
       let tox = 0, toy = 0;
-      const th = (gx, gy) => PT[((gy - toy) & PM) * PN + ((gx - tox) & PM)];
+      // smoothOn: the modern style, read once per painted frame (no stipple: every shade rounds to its nearest level).
+      let smoothOn = false;
+      const th = (gx, gy) => (smoothOn ? 0.5 : PT[((gy - toy) & PM) * PN + ((gx - tox) & PM)]);
       const K = o.matrix ? 4 : 1;
       const GAP = PAL[0].map((c) => (c * 0.7) | 0);
       const SCAN = o.scan ?? 1;
@@ -88,17 +93,59 @@
         if (gx < 0 || gy < 0 || gx >= gw || gy >= gh) return;
         if (mask) { const r = mask(gx, gy); if (!r) return; if (r === 2) c = PAL[L]; }
         if (gx < dx0) dx0 = gx; if (gx > dx1) dx1 = gx; if (gy < dy0) dy0 = gy; if (gy > dy1) dy1 = gy;
-        const f = SCAN !== 1 && gy & 1 ? SCAN : 1;
+        const f = !smoothOn && SCAN !== 1 && gy & 1 ? SCAN : 1;
         const r = c[0] * f, g = c[1] * f, b = c[2] * f;
         if (K === 1) { const i = (gy * IW + gx) * 4; d[i] = r; d[i + 1] = g; d[i + 2] = b; d[i + 3] = a; return; }
         for (let j = 0; j < K; j++) for (let k = 0; k < K; k++) {
           const i = ((gy * K + j) * IW + gx * K + k) * 4;
-          const on = j < 3 && k < 3 && !((j !== 1) && (k !== 1) && o.round);
+          const on = smoothOn || (j < 3 && k < 3 && !((j !== 1) && (k !== 1) && o.round));
           if (on) { d[i] = r; d[i + 1] = g; d[i + 2] = b; d[i + 3] = a; }
           else if (!clear || solid) { d[i] = GAP[0]; d[i + 1] = GAP[1]; d[i + 2] = GAP[2]; d[i + 3] = solid ? a : 255; }
         }
       };
       const put = (x, y, lvl = 0) => setPx(x, y, PAL[clamp(lvl, 0, L)]);
+      // ---- modern: Scale2x (EPX) on the cells, two or three times, then a soft resample to the cell size ----
+      // Scale2x keeps every colour exact and only fills in a corner where both neighbours along it agree, so outlines
+      // turn into smooth diagonals and curves without blurring the face; the last resample softens what's left.
+      const scale2x = (src, w, h) => {
+        const out = new Uint32Array(w * h * 4), W2 = w * 2;
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            const p = src[y * w + x];
+            const a = y > 0 ? src[(y - 1) * w + x] : p, d = y < h - 1 ? src[(y + 1) * w + x] : p;
+            const c = x > 0 ? src[y * w + x - 1] : p, b = x < w - 1 ? src[y * w + x + 1] : p;
+            const i = y * 2 * W2 + x * 2;
+            out[i] = c === a && c !== d && a !== b ? a : p;
+            out[i + 1] = a === b && a !== c && b !== d ? b : p;
+            out[i + W2] = d === c && d !== b && c !== a ? c : p;
+            out[i + W2 + 1] = b === d && b !== a && d !== c ? d : p;
+          }
+        }
+        return out;
+      };
+      const sm = document.createElement('canvas'), smx = sm.getContext('2d');
+      const smoothGrid = (ctx, r) => {
+        if (!r) return;
+        const c0 = Math.max(0, r[0] - 1), r0 = Math.max(0, r[1] - 1), c1 = Math.min(gw, r[2] + 1), r1 = Math.min(gh, r[3] + 1);
+        let w = c1 - c0, h = r1 - r0;
+        if (w <= 0 || h <= 0) return;
+        // One colour per cell (in matrix mode every subpixel of a lit cell holds it).
+        let px = new Uint32Array(w * h);
+        const o1 = K > 1 ? 1 : 0;
+        for (let y = 0; y < h; y++) {
+          const row = ((r0 + y) * K + o1) * IW + c0 * K + o1;
+          for (let x = 0; x < w; x++) px[y * w + x] = u32[row + x * K];
+        }
+        const passes = P >= 8 && w * h < 9000 ? 3 : 2;
+        for (let i = 0; i < passes; i++) { px = scale2x(px, w, h); w *= 2; h *= 2; }
+        if (sm.width < w || sm.height < h) { sm.width = Math.max(sm.width, w); sm.height = Math.max(sm.height, h); }
+        const id = new ImageData(new Uint8ClampedArray(px.buffer), w, h);
+        smx.putImageData(id, 0, 0);
+        ctx.save();
+        ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(sm, 0, 0, w, h, c0 * P, r0 * P, (c1 - c0) * P, (r1 - r0) * P);
+        ctx.restore();
+      };
       // JARVIS draws points that overlap; the brightest one in each cell wins, then they're written once.
       const jbuf = new Map();
       const jput = (x, y, l) => {
@@ -729,6 +776,7 @@
         },
         paint(env) {
           ready = false; rect = null;
+          smoothOn = Roamie.style === 'modern';
           // Drawn natively while it follows (m.native): nothing here until the page takes it back.
           if (!img || pres.state === 'hidden' || m.native) return null;
           d = img.data; clear = !!env.transparent;
@@ -908,11 +956,16 @@
             ctx.save();
             ctx.translate(bx, by - mx.lift); ctx.rotate(mx.rot); ctx.scale(Math.max(mx.sx, 0.0001), Math.max(mx.sy, 0.0001)); ctx.translate(-bx, -by);
           }
-          if (!crt || crt.sx > 0.01) ctx.drawImage(off, sx, sy, sw, sh, X, Y, DW, DH);
+          // Modern: the lit cells (or the whole patch when the background is painted too), smoothed.
+          const grid = () => {
+            if (smoothOn) return smoothGrid(ctx, clear && pd ? pd : rect);
+            ctx.drawImage(off, sx, sy, sw, sh, X, Y, DW, DH);
+          };
+          if (!crt || crt.sx > 0.01) grid();
           if (crt && crt.flash > 0.01 && crt.sx > 0.01) {
             // over-exposed tube warming up / cooling down
             ctx.save(); ctx.globalCompositeOperation = 'lighter'; ctx.globalAlpha = crt.flash * 0.85;
-            ctx.drawImage(off, sx, sy, sw, sh, X, Y, DW, DH); ctx.restore();
+            grid(); ctx.restore();
           }
           if (bloom && (!crt || crt.sx > 0.01)) {
             const bw = (cx1 - cx0) / 4, bh = (cy1 - cy0) / 4;

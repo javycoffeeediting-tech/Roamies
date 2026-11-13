@@ -728,6 +728,10 @@
   function render(focusKey, animate = false) {
     if (!state) return;
     document.documentElement.dataset.style = state.style === 'modern' ? 'modern' : 'retro';
+    // The live looks (header, Appearance tiles, Ken) draw smooth in the modern style too (10-dither.js).
+    if (window.Roamie) window.Roamie.style = document.documentElement.dataset.style;
+    // Acrylic behind the window (Windows, macOS): the modern frame lets it show through.
+    document.documentElement.dataset.acrylic = state.acrylic ? 'on' : 'off';
     const active = document.activeElement;
     // Never rebuild under someone typing a key: catch up when they leave the field.
     if (!focusKey && !animate && active?.tagName === 'INPUT' && active.closest('.pane')) { deferred = true; return; }
@@ -743,7 +747,8 @@
     draw();
     // Lists show as many rows as fit: drawn once to measure, again if a different number fits.
     if (fit()) draw();
-    pane.closest('.body').scrollTop = scroll;
+    // The same page keeps its place as it updates; another page starts at its top.
+    pane.closest('.body').scrollTop = same ? scroll : 0;
     if (same && !animate) for (const n of pane.querySelectorAll('[data-anim]')) if (shown(n) && !before.has(n.dataset.anim)) grow(n, true);
     // Rows fill in one after another (a page's worth; the rest come with the last), only when it opens or
     // the tab changes, never on the updates that arrive while it's open.
@@ -917,7 +922,7 @@
       geminiShared: new URLSearchParams(location.search).has('shared'), geminiModel: 'gemini-3.8-flash-lite-tts',
       geminiModels: [{ id: 'gemini-3.8-flash-lite-tts', name: 'Flash Lite', per10s: 0.0015 }, { id: 'gemini-3.8-flash-tts', name: 'Flash', per10s: 0.00225 }],
       fishModels: [{ id: 'drama-3', name: 'Drama 3', perM: 50, promo: { perM: 10, until: '2026-12-01T08:00:00Z' } }, { id: 's2.1-pro', name: 'S2.1 Pro', perM: 15 }],
-      voice: { on: true, keys: '⌃⌥', ready: true, mac: true, mute: true, wakeWord: false, wake: true, wakeWords: ['Hey Roamies', 'Hey Jarvis'], wakeSay: '“Hey Roamies” or “Hey Jarvis”', pauseSends: false, endWords: ['over', 'go'], cancelWords: ['cancel', 'never mind'], download: null }, voiceSpeed: 1.3, voiceSpeeds: [1, 1.15, 1.3, 1.5, 1.75], bubbleOnly: false, style: 'modern', styles: [['retro', 'Retro'], ['modern', 'Modern']], history: { on: true, file: '~/Roamies/prompt_history.txt' }, autoAllow: false, askKeys: '⌥⌘',
+      voice: { on: true, keys: '⌃⌥', ready: true, mac: true, mute: true, wakeWord: false, wake: true, wakeWords: ['Hey Roamies', 'Hey Jarvis'], wakeSay: '“Hey Roamies” or “Hey Jarvis”', pauseSends: false, endWords: ['over', 'go'], cancelWords: ['cancel', 'never mind'], download: null }, voiceSpeed: 1.3, voiceSpeeds: [1, 1.15, 1.3, 1.5, 1.75], bubbleOnly: false, style: 'modern', styles: [['retro', 'Retro'], ['modern', 'Modern']], acrylic: true, history: { on: true, file: '~/Roamies/prompt_history.txt' }, autoAllow: false, askKeys: '⌥⌘',
       sound: true, actions: false, login: { on: true },
       update: { available: new URLSearchParams(location.search).has('update') && new URLSearchParams(location.search).get('update') !== 'failed' ? '0.9.1' : null, installing: false, checking: false, result: null },
       intro: false,

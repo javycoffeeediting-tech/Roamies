@@ -243,14 +243,7 @@
   // Our chrome for cards and chips: stepped corners, dark glass, an accent edge, a glint along the top.
   function chrome(c, x, y, w, h, o = {}) {
     const path = steppedPath(x, y, w, h, o.corner ?? 2 * P), edge = o.edge || ACC;
-    if (modern()) {
-      c.save();
-      c.fillStyle = o.fill || 'rgba(20,24,30,0.95)'; c.shadowColor = 'rgba(0,0,0,0.38)'; c.shadowBlur = 18; c.shadowOffsetY = 6; c.fill(path);
-      c.shadowColor = 'transparent'; c.shadowBlur = 0; c.shadowOffsetY = 0;
-      c.strokeStyle = o.edge ? rgba(edge, 0.55) : 'rgba(255,255,255,0.13)'; c.lineWidth = 1; c.stroke(path);
-      c.restore();
-      return;
-    }
+    if (modern()) return R.glass.acrylic(c, path, x, y, w, h, { fill: o.fill, edge: o.edge });
     c.save();
     c.fillStyle = o.fill || GLASS; c.shadowColor = 'rgba(0,0,0,0.35)'; c.shadowBlur = 14; c.shadowOffsetY = 4; c.fill(path);
     c.shadowColor = rgba(edge, 0.7); c.shadowBlur = 8; c.shadowOffsetY = 0; c.strokeStyle = edge; c.lineWidth = 1.5; c.globalAlpha *= 0.9; c.stroke(path);

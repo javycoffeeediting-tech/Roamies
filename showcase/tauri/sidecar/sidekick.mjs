@@ -6,7 +6,7 @@
 // out: {type:'menu', items} {type:'ui', msg} {type:'overlays', ids}
 import { Agent } from '@kenkaiiii/gg-agent';
 import { ClaudeCodeAgent, closeSpare } from './claudecode.mjs';
-import { SAFE, checkDrawAction, checkLink, checkOpen, checkRead, checkWrite, redactArgs } from './safety.mjs';
+import { SAFE, checkDrawAction, checkLink, checkOpen, checkRead, checkWrite, isYes, redactArgs } from './safety.mjs';
 import { agentsRoot, createAgents, holdAfterLaunch, newsDesk, wantsAgent } from './agents.mjs';
 import { agentEvents, stallWatch } from './agentstream.mjs';
 import { cleanWakeWords, customWake, sayWakeWords, wakeWordsFor } from './wake.mjs';
@@ -68,7 +68,7 @@ const ui = (msg) => {
   send({ type: 'ui', msg });
 };
 const ob = (msg) => send({ type: 'onboard', msg });
-const say = (text, mood) => (onboarding ? ob({ kind: 'say', text, mood }) : ui({ kind: 'say', text, mood }));
+const say = (text, mood) => { guardWake(text); return onboarding ? ob({ kind: 'say', text, mood }) : ui({ kind: 'say', text, mood }); };
 const sayOut = say;
 
 const VERSION = process.env.ROAMIES_VERSION || '0.0.0';
@@ -98,7 +98,7 @@ const DEFAULTS = {
   provider: null, model: null, sound: true, allowActions: false, voice: true,
   onboarded: false, onboardStep: 0, filesAsked: false, keys: DEFAULT_KEYS, muteWhileTalking: true, autoListen: false, wakeWord: false, wakeWords: null, pauseSends: false, setupVersion: 0,
   // End words (said last, they send at once), the prompt history file, how fast replies are spoken, the bubble alone (no creature), and allowing everything without asking.
-  endWords: ['over', 'go'], cancelWords: ['cancel', 'never mind'], promptHistory: true, voiceSpeed: 1.3, bubbleOnly: false, autoAllow: false, style: 'retro', size: 'default', look: 'classic', introDone: false,
+  endWords: ['over', 'go'], cancelWords: ['cancel', 'never mind'], promptHistory: true, voiceSpeed: 1.3, bubbleOnly: false, autoAllow: true, allowedAsks: [], style: 'retro', size: 'default', look: 'classic', introDone: false,
   replies: 'text', // 'voice': spoken (with Fish Audio or Gemini) as well as shown
   tts: 'fish', // which one speaks: 'fish' (Fish Audio), 'gemini' or 'voicestudio' (the VoiceStudio app on this computer)
   studioVoices: {}, // look → its VoiceStudio voice (a saved profile id; none: the selected engine's default voice)
@@ -278,9 +278,25 @@ const SPEEDS = [1, 1.15, 1.3, 1.5, 1.75];
 // The look of everything around the character: retro (LED pixel frames) or modern (rounded, flat, sans-serif).
 const STYLES = [['retro', 'Retro'], ['modern', 'Modern']];
 const styleNow = () => (config.style === 'modern' ? 'modern' : 'retro');
+// The shell: acrylic behind the panel and the smooth tray icon in the modern style.
+const windowStyle = () => send({ type: 'window_style', modern: styleNow() === 'modern' });
+// Real acrylic behind the panel (Windows, macOS); elsewhere the modern panel stays solid.
+const ACRYLIC = process.platform === 'win32' || process.platform === 'darwin';
 const voiceSpeed = () => (SPEEDS.includes(config.voiceSpeed) ? config.voiceSpeed : 1.3);
 // Allow everything: file edits, commands and app control are on, and nothing asks first (the hard safety blocks stay).
 const actionsOn = () => !!config.allowActions || !!config.autoAllow;
+// Permission questions answered Allow are kept (the exact question, newest last), so the same one is never asked
+// again; with Allow everything on, none are asked at all.
+const MAX_ALLOWED = 500;
+const granted = (q) => !!config.autoAllow || (Array.isArray(config.allowedAsks) && config.allowedAsks.includes(String(q ?? '')));
+function grant(q) {
+  const s = String(q ?? '').slice(0, 400);
+  if (!s) return;
+  const list = (Array.isArray(config.allowedAsks) ? config.allowedAsks : []).filter((x) => x !== s);
+  list.push(s);
+  config.allowedAsks = list.slice(-MAX_ALLOWED);
+  saveConfig();
+}
 // What the model is told about the computer. "darwin" alone left it using PC habits: Cmd+End (does nothing in Mac
 // text, so lines landed at the top) and GNU flags like cat -A that macOS doesn't have. Read once; it never changes mid-run.
 const macVersion = (() => { if (!MAC) return ''; try { return execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf8', timeout: 2000 }).trim(); } catch { return ''; } })();
@@ -412,7 +428,7 @@ const agents = createAgents({
   fork, ui, root: agentsRoot(), userName, runner: fileURLToPath(new URL('./agentrun.mjs', import.meta.url)),
   safety: { checkRead, checkWrite, checkOpen, checkLink }, log: (kind, data) => logLine(kind, data),
   config: {
-    model: agentModel, openUrl: (u) => openUrl(u), creds: (m) => credsFor(m.provider, m.model), allowActions: () => actionsOn(), autoAllow: () => !!config.autoAllow, image: () => turnImage,
+    model: agentModel, openUrl: (u) => openUrl(u), creds: (m) => credsFor(m.provider, m.model), allowActions: () => actionsOn(), autoAllow: () => !!config.autoAllow, granted, grant, image: () => turnImage,
     open: (p) => (process.platform === 'win32' ? winOpen(p) : new Promise((r) => execFile(MAC ? 'open' : 'xdg-open', [p], () => r()))),
     reveal: async (p) => reveal(p),
   },
@@ -965,9 +981,43 @@ function warmUp() {
 let frontSoon = null;
 // Auto-listen: the turn whose reply ended on a question, until the overlay says it's been typed out and said.
 let autoTurn = null;
-// Wake word: the voice helper doesn't listen for "Hey Roamies" while a reply runs, until the overlay says it's been
-// typed out and said (reply_said), so Roamies can't wake itself. Let go after a while in case that never comes.
+// Wake word: it keeps listening while a reply runs, so "Hey Roamies, …" can cut in (the take stops the reply and its
+// voice). Only when the words being spoken name one of the wake phrases does it wait, until the overlay says the reply
+// has been typed out and said (reply_said), so Roamies can't wake itself. Let go after a while in case that never comes.
 let wakeHeld = false, wakeHoldTimer = null;
+const wakeNorm = (s) => ` ${String(s ?? '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()} `;
+function guardWake(text) {
+  try {
+    if (wakeHeld || !WAKE_OK || !config.wakeWord || !VOICE_ON()) return;
+    const said = wakeNorm(text);
+    if (wakeWords().some((w) => wakeNorm(w).trim() && said.includes(wakeNorm(w)))) holdWake(true);
+  } catch { /* at start-up, before the settings are read */ }
+}
+// Voice detection paused by the user ("pause voice detection", or the tray menu) until the talk keys are pressed.
+let wakePaused = false;
+function pauseWake(on) {
+  wakePaused = !!on;
+  send({ type: 'wake_pause', on: wakePaused });
+  menu();
+}
+// "Pause voice detection" (and the like) said to it: a command, not a question for the AI.
+const PAUSE_SAID = /^(?:please\s+)?(?:pause|stop|mute|disable|turn\s+off)\s+(?:the\s+)?(?:voice\s+detection|voice\s+recognition|wake\s+words?|wake\s+phrases?|listening|the\s+mic(?:rophone)?|mic(?:rophone)?)(?:\s+(?:until|till|for|please|now|again)\b.*)?[\s.!?]*$/i;
+const RESUME_SAID = /^(?:please\s+)?(?:resume|start|unpause|turn\s+on)\s+(?:the\s+)?(?:voice\s+detection|voice\s+recognition|wake\s+words?|wake\s+phrases?|listening)(?:\s+(?:until|till|for|please|now|again)\b.*)?[\s.!?]*$/i;
+function voiceCommand(text) {
+  if (!WAKE_OK || !config.wakeWord) return false;
+  const t = String(text ?? '').trim().replace(/^[^\p{L}\p{N}]+/u, '');
+  if (PAUSE_SAID.test(t)) {
+    pauseWake(true);
+    say(`Voice detection paused. Press ${talkWords()} or use my ${TRAY} menu to turn it back on.`, 'happy');
+    return true;
+  }
+  if (RESUME_SAID.test(t)) {
+    pauseWake(false);
+    say("I'm listening for my name again.", 'happy');
+    return true;
+  }
+  return false;
+}
 function holdWake(on) {
   clearTimeout(wakeHoldTimer); wakeHoldTimer = null;
   if (on) wakeHoldTimer = setTimeout(() => holdWake(busy), 3 * 60_000);
@@ -994,7 +1044,7 @@ async function prompt(text, image = null, note = '', byVoice = false, news = nul
   if (notReady) return say(notReady, 'concerned');
   busy = true; quiet = false; autoTurn = null;
   saidPending = true; clearTimeout(saidCap); stir();
-  holdWake(true);
+  holdWake(false);
   if (!intro && !text.startsWith('(')) activity.asked(text);
   if (config.promptHistory !== false && !intro && !news && !text.startsWith('(')) logPrompt(text, { voice: byVoice });
   menu();
@@ -1072,6 +1122,7 @@ async function prompt(text, image = null, note = '', byVoice = false, news = nul
         if (launched) continue;
         if (hold != null) { hold += t; continue; }
         reply.push(t); if (fresh) { lastReply = ''; fresh = false; } lastReply += t;
+        guardWake(lastReply);
       }
       else if (e.type === 'turn_end') {
         doneWriting();
@@ -1169,13 +1220,16 @@ const stallMessage = () => `${PROVIDER_LABELS[config.provider] ?? 'The AI'} stop
 let askSeq = 0;
 const pending = new Map();
 function ask(opts, signal) {
+  // A permission question (Allow / Don't allow): yes at once when it's already granted, and kept once allowed.
+  const permission = Array.isArray(opts?.choices) && opts.choices[0] === 'Allow';
+  if (permission && granted(opts.placeholder)) { logLine('ask_granted', {}); return Promise.resolve('Allow'); }
   const id = `a${++askSeq}`;
   const to = onboarding ? ob : ui;
   // The setup guide has no buttons: its answer box takes a typed y.
   if (onboarding && opts.choices) opts = { ...opts, placeholder: `${opts.placeholder} Type y to allow.` };
   to({ kind: 'ask', id, ...opts });
   return new Promise((resolve) => {
-    pending.set(id, resolve);
+    pending.set(id, (v) => { if (permission && isYes(v)) grant(opts.placeholder); resolve(v); });
     // Another route finished first (e.g. the OAuth callback server): close the input bubble.
     signal?.addEventListener('abort', () => { pending.delete(id); to({ kind: 'cancel_ask', id }); resolve(null); }, { once: true });
   });
@@ -1598,6 +1652,7 @@ function menu() {
     { id: 'ask', label: `Ask ${lookName()}…`, enabled: !busy },
     ...(SNAP_OK ? [{ id: 'snap', label: 'Ask About an Area…', accel: keys().snap }] : []),
     { id: 'stop', label: 'Stop', enabled: busy },
+    ...(WAKE_OK && config.voice && config.wakeWord ? [{ id: 'wakepause', label: wakePaused ? 'Resume Voice Detection' : 'Pause Voice Detection' }] : []),
     { id: 'diagnostics', label: 'Save Diagnostics…', enabled: !diagnosing },
     ...(update.available ? [{ sep: true }, { id: 'install_update', label: update.page ? `Get Roamies ${update.available}…` : update.installing ? `Installing ${update.available}…` : `Install Update ${update.available} and Restart`, enabled: !update.installing }] : []),
     { sep: true },
@@ -1653,7 +1708,7 @@ function panelState() {
     facts: listFacts().slice().reverse().map((f) => ({ id: f.id, text: f.text })),
     commitments: openCommitments().map((c) => ({ id: c.id, text: c.text, due: c.due ?? null, when: c.due ? `${fmtWhen(c.due)}${c.repeat ? ` · repeats ${repeatLabel(c.repeat)}` : ''}` : '', overdue: !!(c.due && c.due < Date.now()), repeat: c.repeat ?? null })),
     look: config.look ?? 'classic', looks: LOOKS.map(([id, label]) => [id, label]), name: lookName(),
-    size: sizeNow(), sizes: SIZES, bubbleOnly: !!config.bubbleOnly, style: styleNow(), styles: STYLES,
+    size: sizeNow(), sizes: SIZES, bubbleOnly: !!config.bubbleOnly, style: styleNow(), styles: STYLES, acrylic: ACRYLIC,
     voiceSpeed: voiceSpeed(), voiceSpeeds: SPEEDS, history: { on: config.promptHistory !== false, file: HISTORY_FILE }, autoAllow: !!config.autoAllow,
     replies: VOICE_ON() ? 'voice' : 'text', tts: tts().id, fishKey: hasVoiceKey('fish'), geminiKey: hasVoiceKey('gemini'),
     fishModel: config.fishModel, fishModels: FISH_CHOICES, fishFree: tts().id === 'fish' && speech.on && speech.model.endsWith('-free'),
@@ -1676,7 +1731,7 @@ function panelState() {
 }
 
 
-const voiceConfig = () => send({ type: 'voice_config', enabled: VOICE_OK && config.voice && voiceReady(), mute: config.muteWhileTalking !== false, sound: !!config.sound, wake: WAKE_OK && !!config.wakeWord, ...(CUSTOM_WAKE ? { wakeWords: wakeWords() } : {}), pauseSends: PAUSE_OK && !!config.pauseSends, endWords: endWords(), cancelWords: cancelWords(), ...(NEEDS_MODEL ? { model: MODEL_DIR } : {}) });
+const voiceConfig = () => send({ type: 'voice_config', enabled: VOICE_OK && config.voice && voiceReady(), mute: config.muteWhileTalking !== false, sound: !!config.sound, wake: WAKE_OK && !!config.wakeWord, ...(CUSTOM_WAKE ? { wakeWords: wakeWords() } : {}), pauseSends: PAUSE_OK && !!config.pauseSends, wakePaused, endWords: endWords(), cancelWords: cancelWords(), ...(NEEDS_MODEL ? { model: MODEL_DIR } : {}) });
 
 // Progress goes to the setup guide often and to the tray menu now and then.
 let modelShownAt = 0, modelMenuAt = 0;
@@ -1715,6 +1770,7 @@ const startVoiceDownload = () => {
 };
 const PRIVACY = { microphone: 'Privacy_Microphone', speech: 'Privacy_SpeechRecognition' };
 function onVoice(m) {
+  if (m.type === 'voice_wake_paused') { wakePaused = !!m.on; menu(); return; }
   if (m.type === 'voice_state') { voiceBusy = m.state === 'listening' || m.state === 'processing'; stir(); }
   if (m.type === 'voice_state' && m.state === 'listening') { interruptQuietly('listening'); speech.stop(); warmUp(); } // talking over it stops it
   else if (m.type === 'voice_state' && m.state === 'processing') frontSoon = { at: Date.now(), p: whereNow() };
@@ -1798,6 +1854,7 @@ function onWriteTap() {
 async function onMenu(id, via) {
   if (id === 'show') ui({ kind: 'summon', show: true });
   else if (id === 'ask') await typeToAsk();
+  else if (id === 'wakepause' && WAKE_OK) pauseWake(!wakePaused);
   else if (id === 'stop') { const cancelled = busy; if (busy) logLine('stopped', { by: via === 'esc' ? 'esc' : 'stop' }); endIntro(); controller?.abort(); speech.stop(); ink.stop(cancelled); }
   else if (id === 'new') {
     endIntro();
@@ -1864,7 +1921,7 @@ async function onMenu(id, via) {
   else if (id === 'wakeword' && WAKE_OK) { config.wakeWord = !config.wakeWord; saveConfig(); agentStale = true; voiceConfig(); menu(); }
   else if (id === 'pausesends' && PAUSE_OK) { config.pauseSends = !config.pauseSends; saveConfig(); agentStale = true; voiceConfig(); menu(); }
   else if (id === 'history') { config.promptHistory = config.promptHistory === false; saveConfig(); menu(); }
-  else if (id.startsWith('style:') && STYLES.some(([s]) => s === id.slice(6))) { config.style = id.slice(6); saveConfig(); ui({ kind: 'style', style: styleNow() }); menu(); if (onboarding) obState(); }
+  else if (id.startsWith('style:') && STYLES.some(([s]) => s === id.slice(6))) { config.style = id.slice(6); saveConfig(); ui({ kind: 'style', style: styleNow() }); windowStyle(); menu(); if (onboarding) obState(); }
   else if (id === 'bubbleonly') { config.bubbleOnly = !config.bubbleOnly; saveConfig(); ui({ kind: 'bubble_only', on: config.bubbleOnly }); menu(); }
   else if (id.startsWith('speed:') && SPEEDS.includes(Number(id.slice(6)))) { config.voiceSpeed = Number(id.slice(6)); saveConfig(); ui({ kind: 'speed', v: voiceSpeed() }); menu(); }
   else if (id === 'autoallow') {
@@ -1913,6 +1970,7 @@ async function areaSnap() {
 let snapping = false;
 // Words said while ⌃⌥ was held, maybe with an area marked by drawing on the screen at the same time.
 async function onSpoken(text, area) {
+  if (voiceCommand(text)) { if (area?.file) fs.unlink(area.file).catch(() => {}); return; }
   if (!area?.file) return enqueue(text, { interrupt: true, image: takeSnap(), byVoice: true });
   try {
     await fitImage(area.file);
@@ -2262,6 +2320,7 @@ midnightClean();
 setTimeout(() => checkUpdates(), 20_000);
 setInterval(() => checkUpdates(), 6 * 3600_000);
 voiceConfig();
+windowStyle();
 // First run (or setup never finished): open the guide.
 // v2 added the "Control apps" (Accessibility) permission: people who finished setup before that
 // get the guide once more, on the permissions step.

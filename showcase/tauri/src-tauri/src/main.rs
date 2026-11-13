@@ -35,6 +35,43 @@ static GENERATION: AtomicUsize = AtomicUsize::new(0);
 static SIDEKICK_OVERLAY: Mutex<Option<String>> = Mutex::new(None);
 /// The setup guide is open: voice events go to it (for the "try it" test) instead of the agent.
 static ONBOARDING: AtomicBool = AtomicBool::new(false);
+/// The modern style is on (Settings › Appearance › Style): the panel gets the system's acrylic blur behind it and the
+/// tray shows the smooth icon. The sidecar says which with {"type":"window_style"}.
+static STYLE_MODERN: AtomicBool = AtomicBool::new(false);
+/// The modern tray icon: Roamie as a smooth sphere, 32x32 RGBA (drawn from the same design as icon.png).
+const TRAY_MODERN: &[u8] = include_bytes!("../icons/tray-modern-32.rgba");
+
+/// Acrylic behind the panel in the modern style (Windows; macOS gets its HUD material), none in the retro one.
+fn panel_effects(app: &AppHandle) {
+    let Some(w) = app.get_webview_window(PANEL_LABEL) else { return };
+    if !STYLE_MODERN.load(Ordering::Relaxed) {
+        let _ = w.set_effects(None::<tauri::utils::config::WindowEffectsConfig>);
+        return;
+    }
+    #[cfg(windows)]
+    let fx = tauri::window::EffectsBuilder::new().effect(tauri::window::Effect::Acrylic).color(tauri::window::Color(18, 20, 24, 120)).build();
+    #[cfg(target_os = "macos")]
+    let fx = tauri::window::EffectsBuilder::new().effect(tauri::window::Effect::HudWindow).state(tauri::window::EffectState::Active).build();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let fx = tauri::window::EffectsBuilder::new().build();
+    let _ = w.set_effects(fx);
+}
+
+/// The tray icon for the style: the smooth sphere in the modern one, the LED icon in the retro one (macOS keeps its
+/// template image either way).
+fn tray_style(app: &AppHandle) {
+    #[cfg(not(target_os = "macos"))]
+    if let Some(tray) = app.tray_by_id("roamies") {
+        let icon = if STYLE_MODERN.load(Ordering::Relaxed) {
+            Some(tauri::image::Image::new_owned(TRAY_MODERN.to_vec(), 32, 32))
+        } else {
+            app.default_window_icon().cloned()
+        };
+        let _ = tray.set_icon(icon);
+    }
+    #[cfg(target_os = "macos")]
+    let _ = app;
+}
 const ONBOARDING_LABEL: &str = "onboarding";
 const PANEL_LABEL: &str = "panel";
 /// When the panel last hid because it lost focus: a click on the icon that caused it mustn't reopen it.
@@ -752,6 +789,7 @@ fn show_panel(app: &AppHandle, rect: Option<tauri::Rect>, toggle: bool) {
                 Ok(w) => {
                     #[cfg(target_os = "macos")]
                     over_fullscreen(&w);
+                    panel_effects(app);
                     let app2 = app.clone();
                     w.on_window_event(move |e| {
                         if let tauri::WindowEvent::Focused(false) = e {
@@ -1593,6 +1631,13 @@ fn handle_sidecar(app: &AppHandle, msg: Value) {
         Some("talk_toggle") => to_voice(app, &json!({ "cmd": "toggle" })),
         // Roamies is answering or speaking: the wake word waits, so it can't wake itself.
         Some("wake_hold") => to_voice(app, &json!({ "cmd": "wake_hold", "on": msg.get("on").and_then(Value::as_bool) == Some(true) })),
+        Some("window_style") => {
+            STYLE_MODERN.store(msg.get("modern").and_then(Value::as_bool) == Some(true), Ordering::Relaxed);
+            panel_effects(app);
+            tray_style(app);
+        }
+        // Pause voice detection (said, or from the tray menu) until the talk keys are pressed, or resume it.
+        Some("wake_pause") => to_voice(app, &json!({ "cmd": "wake_pause", "on": msg.get("on").and_then(Value::as_bool) == Some(true) })),
         // Esc while it's listening: drop the take.
         Some("listen_cancel") => to_voice(app, &json!({ "cmd": "cancel" })),
         Some("voice_config") => {
@@ -1610,6 +1655,8 @@ fn handle_sidecar(app: &AppHandle, msg: Value) {
                 // Windows and Linux: the user's own wake phrases (the Mac helper listens for "Hey Roamies").
                 let words = msg.get("wakeWords").filter(|w| w.is_array()).cloned().unwrap_or(Value::Null);
                 to_voice(app, &json!({ "cmd": "wake", "on": wake, "words": words }));
+                let paused = msg.get("wakePaused").and_then(Value::as_bool).unwrap_or(false);
+                to_voice(app, &json!({ "cmd": "wake_pause", "on": paused }));
                 let pause = msg.get("pauseSends").and_then(Value::as_bool).unwrap_or(false);
                 to_voice(app, &json!({ "cmd": "pause_sends", "on": pause }));
                 // Words that, said last, send the take at once ("over", "go").

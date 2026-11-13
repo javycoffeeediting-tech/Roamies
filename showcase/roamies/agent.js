@@ -802,7 +802,9 @@
         if (cy > -1 && cy < ih) { tctx.fillStyle = css(HOT); tctx.fillRect(cx + 0.5, cy + lh * 0.15, Math.max(1.5, t * 0.8), lh * 0.7); }
       }
       // Clip to the frame as it is this instant: it may still be growing, or shrinking away on close.
-      const cx1 = fr.x + fr.w - padX(bb) + 2, cy1 = fr.y + fr.h - padY(bb) - (bb.input?.listen ? (METER + 1) * P : 0) - footH(bb) + 2;
+      // (A pinned bubble has no voice meter, so none of its height is kept for one: that cut the transcript to a sliver.)
+      const meterH = bb.input?.listen && !(pinned() && !bb.expanded) ? (METER + 1) * P : 0;
+      const cx1 = fr.x + fr.w - padX(bb) + 2, cy1 = fr.y + fr.h - padY(bb) - meterH - footH(bb) + 2;
       const cwid = Math.min(iw + t, cx1 - ix), chgt = Math.min(ih + t, cy1 - iy);
       if (cwid <= t || chgt <= t) return;
       ctx.save();

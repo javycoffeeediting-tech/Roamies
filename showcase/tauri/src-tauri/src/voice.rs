@@ -244,6 +244,11 @@ fn handle_voice(app: &AppHandle, msg: Value) {
         app.state::<Voice>().1.store(0, Ordering::Relaxed);
         return;
     }
+    // Voice detection paused or resumed (the talk keys resume it): the tray menu shows which.
+    if msg.get("type").and_then(Value::as_str) == Some("wake_paused") {
+        to_sidecar(app, &json!({ "type": "voice_wake_paused", "on": msg.get("on").and_then(Value::as_bool) == Some(true) }));
+        return;
+    }
     // Windows: the pen trail while circling something (voice-win/src/ink.rs); the overlays draw it, also during setup.
     if msg.get("type").and_then(Value::as_str) == Some("ink") {
         to_overlays(app, &ui);

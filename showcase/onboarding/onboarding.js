@@ -1271,6 +1271,7 @@
         state = msg;
         // Style (Settings › Appearance): modern.css restyles everything when this says modern.
         document.documentElement.dataset.style = msg.style === 'modern' ? 'modern' : 'retro';
+        if (window.Roamie) window.Roamie.style = document.documentElement.dataset.style;
         if (Roamie.sfx) Roamie.sfx.enabled = msg.sound !== false;
         if (first) { sidekick.setLook?.(msg.look); sidekick.setForm?.(msg.size); }
         if (at('welcome')) look.render();

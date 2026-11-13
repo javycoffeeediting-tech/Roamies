@@ -71,6 +71,33 @@
     return p;
   }
   const modern = () => !!R.modern?.();
+  // Modern: frosted glass. The overlay can't blur what's behind it, so a translucent tint, acrylic's grain (made once,
+  // pinned to the screen so it never crawls) and a light sheen along the top stand in for the blur.
+  let grainCanvas = null;
+  const grainOf = (c) => {
+    if (!grainCanvas) {
+      grainCanvas = document.createElement('canvas'); grainCanvas.width = grainCanvas.height = 96;
+      const g = grainCanvas.getContext('2d'), id = g.createImageData(96, 96);
+      let seed = 7;
+      const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+      for (let i = 0; i < id.data.length; i += 4) { id.data[i] = id.data[i + 1] = id.data[i + 2] = 255; id.data[i + 3] = rnd() < 0.5 ? Math.round(rnd() * 18) : 0; }
+      g.putImageData(id, 0, 0);
+    }
+    return c.createPattern(grainCanvas, 'repeat');
+  };
+  function acrylic(c, path, x, y, w, h, o = {}) {
+    c.save();
+    c.fillStyle = o.fill || 'rgba(28,32,40,0.80)'; c.shadowColor = 'rgba(0,0,0,0.34)'; c.shadowBlur = 22; c.shadowOffsetY = 8; c.fill(path);
+    c.shadowColor = 'transparent'; c.shadowBlur = 0; c.shadowOffsetY = 0;
+    c.save(); c.clip(path);
+    const sheen = Math.min(h, 56), g = c.createLinearGradient(0, y, 0, y + sheen);
+    g.addColorStop(0, 'rgba(255,255,255,0.10)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+    c.fillStyle = g; c.fillRect(x, y, w, sheen);
+    c.fillStyle = grainOf(c); c.fillRect(x, y, w, h);
+    c.restore();
+    c.strokeStyle = o.edge ? rgba(o.edge, 0.55) : 'rgba(255,255,255,0.16)'; c.lineWidth = 1; c.stroke(path);
+    c.restore();
+  }
   const steppedPath = (x, y, w, h, c, tail) => {
     if (modern()) return roundPath(x, y, w, h, Math.max(6, (c ?? 8) * 1.5), tail);
     const p = new Path2D(); stepped(x, y, w, h, c, tail).forEach((q, i) => (i ? p.lineTo(q[0], q[1]) : p.moveTo(q[0], q[1]))); p.closePath(); return p;
@@ -79,15 +106,7 @@
   // Dark glass with a soft shadow, the accent edge with its glow, and a glint along the top.
   function chrome(c, x, y, w, h, o = {}) {
     const path = o.path || steppedPath(x, y, w, h, o.corner ?? 8, o.tail), edge = o.edge || ACC;
-    if (modern()) {
-      // Flat glass with a soft drop shadow and a quiet hairline edge (tinted when the card has its own edge colour).
-      c.save();
-      c.fillStyle = 'rgba(20,24,30,0.95)'; c.shadowColor = 'rgba(0,0,0,0.38)'; c.shadowBlur = 18; c.shadowOffsetY = 6; c.fill(path);
-      c.shadowColor = 'transparent'; c.shadowBlur = 0; c.shadowOffsetY = 0;
-      c.strokeStyle = o.edge ? rgba(edge, 0.55) : 'rgba(255,255,255,0.13)'; c.lineWidth = 1; c.stroke(path);
-      c.restore();
-      return;
-    }
+    if (modern()) return acrylic(c, path, x, y, w, h, { edge: o.edge });
     c.save();
     c.fillStyle = GLASS; c.shadowColor = 'rgba(0,0,0,0.35)'; c.shadowBlur = 14; c.shadowOffsetY = 4; c.fill(path);
     c.shadowColor = rgba(edge, 0.7); c.shadowBlur = 8; c.shadowOffsetY = 0; c.strokeStyle = edge; c.lineWidth = 1.5; c.globalAlpha *= 0.9; c.stroke(path);
@@ -188,5 +207,5 @@
     c.restore();
   }
 
-  R.glass = { ACC, HOT, MID, DEEP, EDGE, GLASS, TEXT, DIM, CORAL, NOTE, MONO, rgba, stepped, steppedPath, roundPath, chrome, textW, typed, wrapRows, ringPts, pen, chip, chipW, CHIP_H: 23 };
+  R.glass = { ACC, HOT, MID, DEEP, EDGE, GLASS, TEXT, DIM, CORAL, NOTE, MONO, rgba, stepped, steppedPath, roundPath, acrylic, chrome, textW, typed, wrapRows, ringPts, pen, chip, chipW, CHIP_H: 23 };
 })();

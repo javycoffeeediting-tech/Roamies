@@ -238,8 +238,11 @@ assert.match(agentSystem('maker', { dir: '/x', returns: 'answer' }), /report is 
     return c;
   };
   let allow = true, provider = 'anthropic';
+  // Permissions answered Allow are kept (the sidecar saves them in its config).
+  const grantedQs = new Set();
   const config = {
     model: async () => ({ provider, model: 'm1', route: 'api' }), creds: async () => ({ accessToken: 'k', accountId: 'acc' }),
+    granted: (q) => grantedQs.has(q), grant: (q) => grantedQs.add(q),
     allowActions: () => allow, image: () => ({ type: 'image', mediaType: 'image/png', data: Buffer.from('png').toString('base64') }),
     open: async (p) => opened.push(p), reveal: async (p) => revealed.push(p),
   };
@@ -289,6 +292,17 @@ assert.match(agentSystem('maker', { dir: '/x', returns: 'answer' }), /report is 
   assert.equal(mgr.get(a.id).state, 'working');
   assert.deepEqual(mgr.news(), [], 'answered on its row: nothing left to tell');
   assert.ok(!mgr.answer(a.id, true), 'nothing left to answer');
+  // Allowed once, kept: the same question again goes straight through, no waiting and nothing to tell.
+  assert.ok(grantedQs.has('Run `npm install`?'), 'the allowed question is kept');
+  c.emit('message', { t: 'ask', id: 4, question: 'Run `npm install`?' });
+  assert.deepEqual(c.sent.at(-1), { t: 'reply', id: 4, value: true });
+  assert.equal(mgr.get(a.id).state, 'working', 'not waiting for a yes it already has');
+  assert.deepEqual(mgr.news(), []);
+  // A new question still asks.
+  c.emit('message', { t: 'ask', id: 5, question: 'Delete old builds?' });
+  assert.equal(mgr.get(a.id).state, 'waiting');
+  assert.ok(mgr.answer(a.id, false));
+  assert.ok(!grantedQs.has('Delete old builds?'), 'a no is not kept');
   // Finishing: the result, history.md and index.md.
   fs.writeFileSync(path.join(a.dir, 'files', 'index.html'), '<h1>Woof</h1>');
   const result = checkFinish({ outcome: 'Made a one-page site for Woof Co.', files: [{ path: 'files/index.html', what: 'the page' }] }, { dir: a.dir }).result;
