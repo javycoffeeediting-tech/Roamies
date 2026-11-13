@@ -9,6 +9,8 @@ import { ClaudeCodeAgent, closeSpare } from './claudecode.mjs';
 import { SAFE, checkDrawAction, checkLink, checkOpen, checkRead, checkWrite, redactArgs } from './safety.mjs';
 import { agentsRoot, createAgents, holdAfterLaunch, newsDesk, wantsAgent } from './agents.mjs';
 import { agentEvents, stallWatch } from './agentstream.mjs';
+import { cleanWakeWords, customWake, sayWakeWords, wakeWordsFor } from './wake.mjs';
+import { HISTORY_FILE, logPrompt } from './promptlog.mjs';
 import {
   AUTH_PROVIDERS, AuthStorage, OPENAI_CHATGPT_KEY, apiKeyStorageKeys, claudeCodeEnv, dualAuthProvider, getAuthStorageKeys, getContextWindow, getDefaultModel, getModel,
   getModelsForProvider, loginChatGPT, ollamaServedContext, parseLocalModelId, registerRuntimeModels, resolveClaudeCodeBinary, revokeChatGPTSignIn, signInWithClaudeCode,
@@ -94,7 +96,9 @@ const DEFAULT_KEYS = process.platform === 'win32'
   : { talk: ['control', 'option'], summon: 'Control+Alt+KeyS', snap: 'Control+Alt+KeyA', list: 'Control+Alt+KeyL' };
 const DEFAULTS = {
   provider: null, model: null, sound: true, allowActions: false, voice: true,
-  onboarded: false, onboardStep: 0, filesAsked: false, keys: DEFAULT_KEYS, muteWhileTalking: true, autoListen: false, wakeWord: false, setupVersion: 0, size: 'default', look: 'classic', introDone: false,
+  onboarded: false, onboardStep: 0, filesAsked: false, keys: DEFAULT_KEYS, muteWhileTalking: true, autoListen: false, wakeWord: false, wakeWords: null, pauseSends: false, setupVersion: 0,
+  // End words (said last, they send at once), the prompt history file, how fast replies are spoken, the bubble alone (no creature), and allowing everything without asking.
+  endWords: ['over', 'go'], cancelWords: ['cancel', 'never mind'], promptHistory: true, voiceSpeed: 1.3, bubbleOnly: false, autoAllow: false, style: 'retro', size: 'default', look: 'classic', introDone: false,
   replies: 'text', // 'voice': spoken (with Fish Audio or Gemini) as well as shown
   tts: 'fish', // which one speaks: 'fish' (Fish Audio), 'gemini' or 'voicestudio' (the VoiceStudio app on this computer)
   studioVoices: {}, // look → its VoiceStudio voice (a saved profile id; none: the selected engine's default voice)
@@ -261,6 +265,22 @@ const sendKeys = () => send({ type: 'keybinds', ...keys(), write: HOTKEYS_OK ? k
 const talkHow = () => (HOTKEYS_OK ? `Hold ${talkWords().replace('+', ' and ')}` : 'Press your talk shortcut');
 const talkHowLong = () => (HOTKEYS_OK ? `${talkHow()} while you talk` : 'Press your talk shortcut, talk, then press it again (or just pause)');
 const MAC = process.platform === 'darwin';
+// Wake word: "Hey Roamies" on a Mac; on Windows and Linux (Parakeet on the PC) any phrases the user sets.
+// Send when I pause: a held take sends once the talking stops (the Parakeet helper only, for now).
+const WAKE_OK = VOICE_OK && (MAC || NEEDS_MODEL);
+const CUSTOM_WAKE = WAKE_OK && customWake(process.platform);
+const PAUSE_OK = VOICE_OK && NEEDS_MODEL;
+const wakeWords = () => wakeWordsFor(process.platform, config.wakeWords);
+const endWords = () => (PAUSE_OK ? cleanWakeWords(config.endWords) : []);
+// Cancel words: said last, they drop the take (nothing is sent).
+const cancelWords = () => (PAUSE_OK ? cleanWakeWords(config.cancelWords) : []);
+const SPEEDS = [1, 1.15, 1.3, 1.5, 1.75];
+// The look of everything around the character: retro (LED pixel frames) or modern (rounded, flat, sans-serif).
+const STYLES = [['retro', 'Retro'], ['modern', 'Modern']];
+const styleNow = () => (config.style === 'modern' ? 'modern' : 'retro');
+const voiceSpeed = () => (SPEEDS.includes(config.voiceSpeed) ? config.voiceSpeed : 1.3);
+// Allow everything: file edits, commands and app control are on, and nothing asks first (the hard safety blocks stay).
+const actionsOn = () => !!config.allowActions || !!config.autoAllow;
 // What the model is told about the computer. "darwin" alone left it using PC habits: Cmd+End (does nothing in Mac
 // text, so lines landed at the top) and GNU flags like cat -A that macOS doesn't have. Read once; it never changes mid-run.
 const macVersion = (() => { if (!MAC) return ''; try { return execFileSync('sw_vers', ['-productVersion'], { encoding: 'utf8', timeout: 2000 }).trim(); } catch { return ''; } })();
@@ -359,7 +379,7 @@ const userName = (() => {
 // The open request's voice, if replies are spoken: draw's beat lines are said on it, in order with the reply.
 let turnVoice = null;
 const { tools, hands, whereNow, ink, nextTurn } = createTools({
-  allowActions: () => config.allowActions, ui, ask, openUrl, userName,
+  allowActions: () => actionsOn(), autoAllow: () => !!config.autoAllow, ui, ask, openUrl, userName,
   speak: (line) => { if (!turnVoice) return false; turnVoice.say(line); return true; },
   onHandoff: (task) => { activity.handoff(task); panel(); },
   commitmentsText: () => [commitmentsText(), doneTodayText() && `Done today:\n${doneTodayText()}`].filter(Boolean).join('\n'),
@@ -384,7 +404,7 @@ tools.push({
   name: 'about_roamies',
   description: 'How Roamies works: where it lives, its menus, the panel and each settings page, updates, what to do when something is not working, and who made it. Call it before answering a question about the app.',
   parameters: z.object({}),
-  execute: async () => aboutRoamies({ name: lookName(), looks: LOOKS.map(([, label]) => label), mac: MAC, linux: LINUX, snap: SNAP_OK, pointer: POINTER_OK, voice: VOICE_OK, hotkeys: HOTKEYS_OK }),
+  execute: async () => aboutRoamies({ name: lookName(), looks: LOOKS.map(([, label]) => label), mac: MAC, linux: LINUX, snap: SNAP_OK, pointer: POINTER_OK, voice: VOICE_OK, hotkeys: HOTKEYS_OK, wake: WAKE_OK, wakeSay: WAKE_OK ? sayWakeWords(wakeWords()) : '', pauseSends: PAUSE_OK }),
 });
 // Background agents (agents.mjs): each runs in its own process on the model picked when it starts.
 let turnImage = null; // the picture sent with the request being answered, for send_agent's "snap"
@@ -392,7 +412,7 @@ const agents = createAgents({
   fork, ui, root: agentsRoot(), userName, runner: fileURLToPath(new URL('./agentrun.mjs', import.meta.url)),
   safety: { checkRead, checkWrite, checkOpen, checkLink }, log: (kind, data) => logLine(kind, data),
   config: {
-    model: agentModel, openUrl: (u) => openUrl(u), creds: (m) => credsFor(m.provider, m.model), allowActions: () => !!config.allowActions, image: () => turnImage,
+    model: agentModel, openUrl: (u) => openUrl(u), creds: (m) => credsFor(m.provider, m.model), allowActions: () => actionsOn(), autoAllow: () => !!config.autoAllow, image: () => turnImage,
     open: (p) => (process.platform === 'win32' ? winOpen(p) : new Promise((r) => execFile(MAC ? 'open' : 'xdg-open', [p], () => r()))),
     reveal: async (p) => reveal(p),
   },
@@ -521,8 +541,8 @@ const livePrompt = (context = '') => {
   lastFactIds = facts.map((f) => f.id);
   const open = commitmentsText(), done = doneTodayText(), working = agents.liveText();
   const turn = `Live state (current as of this moment):
-${frontNow ? `${frontNow}\n` : ''}- Editing files, running commands and controlling other apps: ${config.allowActions ? 'ALLOWED' : `switched OFF (tell the user to turn on "Allow File Edits & Commands" on the Behavior page in ${PANEL} if they want it)`}.
-${VOICE_OK ? `- Voice: ${!config.voice ? 'off' : voiceReady() ? `on; ${HOTKEYS_OK ? `${userName} holds ${talkWords()} to talk` : `${userName} presses the key they bound to ${BIND.talk} to start talking and again to send (a pause sends too)`}${config.autoListen ? '. Auto-listen is on: when your reply to a spoken question ends with a question, the mic opens by itself for their answer' : ''}${MAC && config.wakeWord ? `. Wake word is on: ${userName} can also say "Hey Roamies" to start talking hands-free, and what they say right after it is the request` : ''}` : `on, but the speech model isn't downloaded yet (${voiceModel.status === 'downloading' ? 'downloading now' : `the Voice page in ${PANEL}`})`}.` : ''}
+${frontNow ? `${frontNow}\n` : ''}- Editing files, running commands and controlling other apps: ${config.autoAllow ? 'ALLOWED, with no confirmation prompts (the user turned on Allow everything: just do what was asked)' : config.allowActions ? 'ALLOWED' : `switched OFF (tell the user to turn on "Allow File Edits & Commands" on the Behavior page in ${PANEL} if they want it)`}.
+${VOICE_OK ? `- Voice: ${!config.voice ? 'off' : voiceReady() ? `on; ${HOTKEYS_OK ? `${userName} holds ${talkWords()} to talk` : `${userName} presses the key they bound to ${BIND.talk} to start talking and again to send (a pause sends too)`}${config.autoListen ? '. Auto-listen is on: when your reply to a spoken question ends with a question, the mic opens by itself for their answer' : ''}${PAUSE_OK && config.pauseSends ? '. Send when I pause is on: holding the talk keys, what they said goes as soon as they stop talking' : ''}${WAKE_OK && config.wakeWord ? `. Wake word is on: ${userName} can also say ${sayWakeWords(wakeWords())} to start talking hands-free, and what they say right after it is the request` : ''}` : `on, but the speech model isn't downloaded yet (${voiceModel.status === 'downloading' ? 'downloading now' : `the Voice page in ${PANEL}`})`}.` : ''}
 - Shortcuts: ${HOTKEYS_OK ? `type a question to you: a quick tap of ${writeWords()} (press both and let go), which opens a text field beside the cursor (Enter sends, Shift+Enter adds a line, Esc or another tap closes it); show or hide you ${keyWords(keys().summon)}` : `on this Wayland desktop no app can have global shortcuts, so ${userName} binds keys to these commands in their desktop's keyboard settings: ${BIND.summon} (show or hide you), ${BIND.ask} (ask you), ${BIND.list} (the list), ${BIND.talk} (talk) and ${BIND.panel} (the panel)`}${SNAP_OK ? `; ask about an area ${keyWords(keys().snap)}` : ''}${CIRCLE_OK ? "; while holding the talk keys, moving the cursor round something circles it (no clicking; it snaps shut with a click when the circle closes, and loose lines don't count) and you'll see what they circled" : ''}${HOTKEYS_OK ? `; show the list ${keyWords(keys().list)}` : ''}.${HANDS_OK ? '' : ' Asking about an area, reading app windows, finding things on screen by their words and working other apps need the Roamies app, which isn\'t running here; draw there with x, y from a screenshot.'}`;
   const memory = `${open ? `Open commitments:\n${open}` : 'No open commitments.'}${done ? `\nDone today (ticked off on the list or by you; still shown struck through until midnight):\n${done}` : ''}
 ${facts.length ? `What you know about ${userName}${total > facts.length ? ` (${facts.length} most relevant of ${total})` : ''}:\n${facts.map((f) => `- ${f.id}: ${f.text}`).join('\n')}` : `You don't know anything lasting about ${userName} yet.`}${working ? `\n${working}` : ''}`;
@@ -953,7 +973,7 @@ function holdWake(on) {
   if (on) wakeHoldTimer = setTimeout(() => holdWake(busy), 3 * 60_000);
   if (on === wakeHeld) return;
   wakeHeld = on;
-  if (MAC) send({ type: 'wake_hold', on });
+  if (WAKE_OK) send({ type: 'wake_hold', on });
 }
 const autoListenOn = () => VOICE_OK && !!config.voice && !!config.autoListen && voiceReady() && !intro;
 // The agents' news waits for a quiet moment (desk.tick): nothing running or queued, not listening, the last reply
@@ -976,6 +996,7 @@ async function prompt(text, image = null, note = '', byVoice = false, news = nul
   saidPending = true; clearTimeout(saidCap); stir();
   holdWake(true);
   if (!intro && !text.startsWith('(')) activity.asked(text);
+  if (config.promptHistory !== false && !intro && !news && !text.startsWith('(')) logPrompt(text, { voice: byVoice });
   menu();
   controller = new AbortController();
   agent.setSignal(controller.signal);
@@ -1632,7 +1653,8 @@ function panelState() {
     facts: listFacts().slice().reverse().map((f) => ({ id: f.id, text: f.text })),
     commitments: openCommitments().map((c) => ({ id: c.id, text: c.text, due: c.due ?? null, when: c.due ? `${fmtWhen(c.due)}${c.repeat ? ` · repeats ${repeatLabel(c.repeat)}` : ''}` : '', overdue: !!(c.due && c.due < Date.now()), repeat: c.repeat ?? null })),
     look: config.look ?? 'classic', looks: LOOKS.map(([id, label]) => [id, label]), name: lookName(),
-    size: sizeNow(), sizes: SIZES,
+    size: sizeNow(), sizes: SIZES, bubbleOnly: !!config.bubbleOnly, style: styleNow(), styles: STYLES,
+    voiceSpeed: voiceSpeed(), voiceSpeeds: SPEEDS, history: { on: config.promptHistory !== false, file: HISTORY_FILE }, autoAllow: !!config.autoAllow,
     replies: VOICE_ON() ? 'voice' : 'text', tts: tts().id, fishKey: hasVoiceKey('fish'), geminiKey: hasVoiceKey('gemini'),
     fishModel: config.fishModel, fishModels: FISH_CHOICES, fishFree: tts().id === 'fish' && speech.on && speech.model.endsWith('-free'),
     geminiVoice: geminiVoice(), geminiVoices: GEMINI_VOICES, geminiShared: ttsKeys.gemini === 'shared',
@@ -1640,6 +1662,8 @@ function panelState() {
     studio: tts().local ? studioState() : null,
     voice: VOICE_OK ? {
       on: !!config.voice, keys: HOTKEYS_OK ? talkSymbols() : null, ready: voiceReady(), mac: MAC, mute: config.muteWhileTalking !== false, autoListen: !!config.autoListen, wakeWord: !!config.wakeWord,
+      wake: WAKE_OK, wakeWords: CUSTOM_WAKE ? wakeWords() : null, wakeSay: WAKE_OK ? sayWakeWords(wakeWords()) : null, pauseSends: PAUSE_OK ? !!config.pauseSends : null,
+      endWords: PAUSE_OK ? endWords() : null, cancelWords: PAUSE_OK ? cancelWords() : null,
       download: NEEDS_MODEL && config.voice && !voiceReady() ? { status: voiceModel.status, pct: voiceModel.total ? Math.floor((voiceModel.done / voiceModel.total) * 100) : 0, size: sizeLabel() } : null,
     } : null,
     sound: !!config.sound, actions: !!config.allowActions,
@@ -1652,7 +1676,7 @@ function panelState() {
 }
 
 
-const voiceConfig = () => send({ type: 'voice_config', enabled: VOICE_OK && config.voice && voiceReady(), mute: config.muteWhileTalking !== false, sound: !!config.sound, wake: MAC && !!config.wakeWord, ...(NEEDS_MODEL ? { model: MODEL_DIR } : {}) });
+const voiceConfig = () => send({ type: 'voice_config', enabled: VOICE_OK && config.voice && voiceReady(), mute: config.muteWhileTalking !== false, sound: !!config.sound, wake: WAKE_OK && !!config.wakeWord, ...(CUSTOM_WAKE ? { wakeWords: wakeWords() } : {}), pauseSends: PAUSE_OK && !!config.pauseSends, endWords: endWords(), cancelWords: cancelWords(), ...(NEEDS_MODEL ? { model: MODEL_DIR } : {}) });
 
 // Progress goes to the setup guide often and to the tray menu now and then.
 let modelShownAt = 0, modelMenuAt = 0;
@@ -1824,7 +1848,7 @@ async function onMenu(id, via) {
   }
   else if (id === 'sound') { config.sound = !config.sound; saveConfig(); ui({ kind: 'sound', on: config.sound }); voiceConfig(); menu(); }
   else if (id === 'actions') {
-    config.allowActions = !config.allowActions; agents.setAllow(config.allowActions); saveConfig(); menu(); // live section picks this up
+    config.allowActions = !config.allowActions; agents.setAllow(actionsOn(), !!config.autoAllow); saveConfig(); menu(); // live section picks this up
     say(config.allowActions ? 'File edits and commands are on. I promise to be careful.' : 'File edits and commands are off. Hands to myself!', config.allowActions ? 'determined' : 'happy');
   } else if (id === 'update') checkUpdates(true);
   else if (id === 'install_update') installUpdate();
@@ -1835,9 +1859,18 @@ async function onMenu(id, via) {
   else if (id === 'intro') send({ type: 'onboarding', mode: 'chat' });
   else if (id === 'snap') areaSnap();
   else if (id === 'list') showList({ seconds: 20 });
-  else if (id === 'mutetalk') { config.muteWhileTalking = config.muteWhileTalking === false; saveConfig(); voiceConfig(); menu(); }
   else if (id === 'autolisten') { config.autoListen = !config.autoListen; saveConfig(); menu(); }
-  else if (id === 'wakeword' && MAC) { config.wakeWord = !config.wakeWord; saveConfig(); agentStale = true; voiceConfig(); menu(); }
+  else if (id === 'mutetalk') { config.muteWhileTalking = config.muteWhileTalking === false; saveConfig(); voiceConfig(); menu(); }
+  else if (id === 'wakeword' && WAKE_OK) { config.wakeWord = !config.wakeWord; saveConfig(); agentStale = true; voiceConfig(); menu(); }
+  else if (id === 'pausesends' && PAUSE_OK) { config.pauseSends = !config.pauseSends; saveConfig(); agentStale = true; voiceConfig(); menu(); }
+  else if (id === 'history') { config.promptHistory = config.promptHistory === false; saveConfig(); menu(); }
+  else if (id.startsWith('style:') && STYLES.some(([s]) => s === id.slice(6))) { config.style = id.slice(6); saveConfig(); ui({ kind: 'style', style: styleNow() }); menu(); if (onboarding) obState(); }
+  else if (id === 'bubbleonly') { config.bubbleOnly = !config.bubbleOnly; saveConfig(); ui({ kind: 'bubble_only', on: config.bubbleOnly }); menu(); }
+  else if (id.startsWith('speed:') && SPEEDS.includes(Number(id.slice(6)))) { config.voiceSpeed = Number(id.slice(6)); saveConfig(); ui({ kind: 'speed', v: voiceSpeed() }); menu(); }
+  else if (id === 'autoallow') {
+    config.autoAllow = !config.autoAllow; agents.setAllow(actionsOn(), config.autoAllow); saveConfig(); agentStale = true; menu();
+    say(config.autoAllow ? "Everything's allowed now: I won't ask before commands, file edits or using your apps." : "Okay, I'll ask before anything risky again.", config.autoAllow ? 'determined' : 'happy');
+  }
   else if (id === 'voicedl') startVoiceDownload();
   else if (id === 'voice') {
     config.voice = !config.voice; saveConfig(); voiceConfig(); menu();
@@ -1977,7 +2010,10 @@ function obState() {
     sound: config.sound,
     voice: VOICE_OK && config.voice,
     autoListen: !!config.autoListen,
-    wakeWord: MAC && !!config.wakeWord,
+    wakeWord: WAKE_OK && !!config.wakeWord,
+    wakeOk: WAKE_OK,
+    style: styleNow(),
+    wakeSay: WAKE_OK ? sayWakeWords(wakeWords()) : null,
     voiceModel: NEEDS_MODEL ? { status: voiceModel.status, done: voiceModel.done, total: voiceModel.total, error: voiceModel.error, size: sizeLabel() } : null,
     filesAsked: config.filesAsked,
     look: config.look ?? 'classic',
@@ -2031,10 +2067,10 @@ async function onGuide(m) {
   else if (m.type === 'ob_login_cancel') cancelLogin(typeof m.id === 'string' ? m.id : undefined);
   else if (m.type === 'ob_apikey') apiKeyLogin(m.provider, String(m.key ?? '')).catch((e) => { const p = problem('key', e, { store: KEY_STORE }); ob({ kind: 'login', provider: m.provider, phase: 'error', error: p.text, ...linked(p) }); });
   else if (m.type === 'ob_files') ob({ kind: 'files', status: await filesStatus(!!m.request) });
-  else if (m.type === 'set_actions') { config.allowActions = !!m.on; agents.setAllow(config.allowActions); saveConfig(); menu(); obState(); }
+  else if (m.type === 'set_actions') { config.allowActions = !!m.on; agents.setAllow(actionsOn(), !!config.autoAllow); saveConfig(); menu(); obState(); }
   else if (m.type === 'set_login') setLogin(!!m.on);
   else if (m.type === 'ob_autolisten') { config.autoListen = !!m.on; saveConfig(); menu(); obState(); }
-  else if (m.type === 'ob_wake' && MAC) { config.wakeWord = !!m.on; saveConfig(); agentStale = true; voiceConfig(); menu(); obState(); }
+  else if (m.type === 'ob_wake' && WAKE_OK) { config.wakeWord = !!m.on; saveConfig(); agentStale = true; voiceConfig(); menu(); obState(); }
   else if (m.type === 'ob_voice_model') getVoiceModel();
   else if (m.type === 'ob_look') setLook(m.look);
   else if (m.type === 'ob_size' && SIZES.some(([s]) => s === m.size)) { config.size = m.size; saveConfig(); ui({ kind: 'size', size: config.size }); menu(); }
@@ -2083,6 +2119,13 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     if (storageKeyProvider(id) !== m.provider) return;
     apiKeyLogin(id, m.key.slice(0, 1000)).then(() => panelNote(signedIn.get(m.provider) ? `${label} is connected.` : `That ${label} key didn't work.`, !signedIn.get(m.provider)))
       .catch((e) => { const p = problem('key', e, { store: KEY_STORE }); panelNote(p.text, true, p); });
+  } else if (m.type === 'panel_cancelwords' && PAUSE_OK) {
+    config.cancelWords = cleanWakeWords(m.words); saveConfig(); voiceConfig(); menu();
+  } else if (m.type === 'panel_endwords' && PAUSE_OK) {
+    config.endWords = cleanWakeWords(m.words); saveConfig(); voiceConfig(); menu();
+  } else if (m.type === 'panel_wakewords' && CUSTOM_WAKE) {
+    const words = cleanWakeWords(m.words);
+    config.wakeWords = words.length ? words : null; saveConfig(); agentStale = true; voiceConfig(); menu();
   } else if ((m.type === 'panel_fishkey' || m.type === 'panel_geminikey') && typeof m.key === 'string') voiceKeyLogin({ provider: m.type === 'panel_geminikey' ? 'gemini' : 'fish', given: m.key.slice(0, 1000), note: panelNote }).catch((e) => console.error('voice key', e));
   else if (m.type === 'answer') { pending.get(m.id)?.(m.text ?? null); pending.delete(m.id); }
   else if (m.type === 'ui_ready') {
@@ -2090,6 +2133,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     ui({ kind: 'sound', on: config.sound });
     ui({ kind: 'size', size: sizeNow() });
     ui({ kind: 'look', look: config.look ?? 'classic' });
+    ui({ kind: 'speed', v: voiceSpeed() });
+    ui({ kind: 'style', style: styleNow() });
+    ui({ kind: 'bubble_only', on: !!config.bubbleOnly });
     if (config.onboarded) ui({ kind: 'greet' });
     agents.sync();
   } else if (m.type?.startsWith('ob_') || m.type?.startsWith('chat_') || m.type === 'set_keys' || m.type === 'set_actions' || m.type === 'set_login' || m.type === 'keybind_error') onGuide(m).catch((e) => console.error('guide', e));

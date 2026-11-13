@@ -761,6 +761,9 @@
             gy0 = clamp(Math.floor(y0 / P), 0, gh); gy1 = clamp(Math.ceil(y1 / P), 0, gh);
           }
           mask = null;
+          // Bubble only (Settings › Appearance): the body isn't painted; its bubbles still are, from the top-left.
+          const hide = !!Roamie.bubbleOnly;
+          if (!hide) {
           if (performing && pres.v === 'materialize') {
             const e = front(), entering = pres.state === 'in', top = by - R * 1.3, H2 = R * 2.7, R2 = R * 1.4;
             mask = entering
@@ -842,6 +845,7 @@
             if (look === 'jarvis') Roamie.jarvis?.readout({ put, L }, gx, gy, icon, act.a, act.dur, !(P < 6 && form === 'default'));
             else bubble(gx, gy, icon);
           }
+          } // !hide
           plug?.gridOver?.(env);
           pd = dx1 >= dx0 ? [dx0, dy0, dx1 + 1, dy1 + 1] : null;
           // Tools, guides and cards also draw outside the grid, so they get the whole screen.
@@ -855,7 +859,8 @@
               Math.min(gw, Math.ceil((dx1 + 1 + a - tox) / a) * a + tox), Math.min(gh, Math.ceil((dy1 + 1 + a - toy) / a) * a + toy)];
           }
           // What the plugin draws off the grid (glass bubbles, tags, cards) widens the patch to cover it, glow and all.
-          const ext = clear && rect ? plug?.extent?.() : null;
+          const ext = clear && (rect || hide) ? plug?.extent?.() : null;
+          if (ext && !rect) rect = [gw, gh, 0, 0]; // nothing on the grid: the bubbles alone make the patch
           if (ext) {
             const a = Math.ceil(20 / P);
             rect = [Math.max(0, Math.min(rect[0], Math.floor(ext[0] / P) - a)), Math.max(0, Math.min(rect[1], Math.floor(ext[1] / P) - a)),
@@ -889,7 +894,8 @@
           ctx.imageSmoothingEnabled = false;
           // Following the cursor: the whole LED layer (and the text drawn over it) slides by the part of a cell
           // the body is past its grid cell, so it glides with the cursor instead of hopping a cell at a time.
-          const glide = !!m.drive && (pres.state === 'shown' || pres.state === 'in');
+          // Bubble only: nothing slides with the hidden body (the pinned bubble must not move at all).
+          const glide = !!m.drive && (pres.state === 'shown' || pres.state === 'in') && !Roamie.bubbleOnly;
           ctx.save();
           // Snapped to whole screen pixels: a part-pixel shift resamples the dots unevenly, so they'd shimmer.
           const dpr = env.dpr || 1;

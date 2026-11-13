@@ -1,5 +1,6 @@
 // The card look shared by the Sidekick's own UI (bubbles, the thinking tag, task tags, the step list): the same
 // stepped corners, dark glass, teal edge, glint and Martian Mono as the drawings' cards (ink.js) and the reminders.
+// The modern style (style.js) draws the same frames rounded and flat: a smooth outline, a quiet edge, no glow.
 (() => {
   const R = window.Roamie;
   if (!R || typeof document === 'undefined') return;
@@ -33,11 +34,60 @@
     pts.splice(after + 1, 0, ...t);
     return pts;
   }
-  const steppedPath = (x, y, w, h, c, tail) => { const p = new Path2D(); stepped(x, y, w, h, c, tail).forEach((q, i) => (i ? p.lineTo(q[0], q[1]) : p.moveTo(q[0], q[1]))); p.closePath(); return p; };
+  // Modern: a rounded rectangle, with a smooth pointed tail on one side ({ side, at, to, w } as for stepped()).
+  function roundPath(x, y, w, h, r = 12, tail = null) {
+    r = Math.max(0, Math.min(r, w / 2, h / 2));
+    const X = x + w, Y = y + h, p = new Path2D();
+    let tp = null;
+    if (tail) {
+      const across = tail.side === 'top' || tail.side === 'bottom', tw = Math.max(8, tail.w ?? 12);
+      const o = across ? x : y, len = across ? w : h;
+      const at = clamp(tail.at, o + r + tw / 2 + 2, o + len - r - tw / 2 - 2);
+      const n = { top: [0, -1], bottom: [0, 1], left: [-1, 0], right: [1, 0] }[tail.side];
+      if (n) {
+        const base = across ? [at, tail.side === 'top' ? y : Y] : [tail.side === 'left' ? x : X, at];
+        const to = tail.to ?? [base[0] + n[0] * 14, base[1] + n[1] * 14];
+        const depth = clamp((to[0] - base[0]) * n[0] + (to[1] - base[1]) * n[1], 6, tail.max ?? 18);
+        const shift = clamp(across ? to[0] - base[0] : to[1] - base[1], -tw, tw) * 0.6;
+        tp = { side: tail.side, a: at - tw / 2, b: at + tw / 2, tip: across ? [base[0] + shift, base[1] + n[1] * depth] : [base[0] + n[0] * depth, base[1] + shift] };
+      }
+    }
+    // The tail on a side, walked in the outline's direction (top: left to right, right: down, bottom: right to left, left: up).
+    const tipOn = (side, fixed, horiz) => {
+      if (tp?.side !== side) return;
+      const [s, e] = side === 'bottom' || side === 'left' ? [tp.b, tp.a] : [tp.a, tp.b];
+      p.lineTo(horiz ? s : fixed, horiz ? fixed : s); p.lineTo(tp.tip[0], tp.tip[1]); p.lineTo(horiz ? e : fixed, horiz ? fixed : e);
+    };
+    p.moveTo(x + r, y);
+    tipOn('top', y, true);
+    p.lineTo(X - r, y); p.arcTo(X, y, X, y + r, r);
+    tipOn('right', X, false);
+    p.lineTo(X, Y - r); p.arcTo(X, Y, X - r, Y, r);
+    tipOn('bottom', Y, true);
+    p.lineTo(x + r, Y); p.arcTo(x, Y, x, Y - r, r);
+    tipOn('left', x, false);
+    p.lineTo(x, y + r); p.arcTo(x, y, x + r, y, r);
+    p.closePath();
+    return p;
+  }
+  const modern = () => !!R.modern?.();
+  const steppedPath = (x, y, w, h, c, tail) => {
+    if (modern()) return roundPath(x, y, w, h, Math.max(6, (c ?? 8) * 1.5), tail);
+    const p = new Path2D(); stepped(x, y, w, h, c, tail).forEach((q, i) => (i ? p.lineTo(q[0], q[1]) : p.moveTo(q[0], q[1]))); p.closePath(); return p;
+  };
 
   // Dark glass with a soft shadow, the accent edge with its glow, and a glint along the top.
   function chrome(c, x, y, w, h, o = {}) {
     const path = o.path || steppedPath(x, y, w, h, o.corner ?? 8, o.tail), edge = o.edge || ACC;
+    if (modern()) {
+      // Flat glass with a soft drop shadow and a quiet hairline edge (tinted when the card has its own edge colour).
+      c.save();
+      c.fillStyle = 'rgba(20,24,30,0.95)'; c.shadowColor = 'rgba(0,0,0,0.38)'; c.shadowBlur = 18; c.shadowOffsetY = 6; c.fill(path);
+      c.shadowColor = 'transparent'; c.shadowBlur = 0; c.shadowOffsetY = 0;
+      c.strokeStyle = o.edge ? rgba(edge, 0.55) : 'rgba(255,255,255,0.13)'; c.lineWidth = 1; c.stroke(path);
+      c.restore();
+      return;
+    }
     c.save();
     c.fillStyle = GLASS; c.shadowColor = 'rgba(0,0,0,0.35)'; c.shadowBlur = 14; c.shadowOffsetY = 4; c.fill(path);
     c.shadowColor = rgba(edge, 0.7); c.shadowBlur = 8; c.shadowOffsetY = 0; c.strokeStyle = edge; c.lineWidth = 1.5; c.globalAlpha *= 0.9; c.stroke(path);
@@ -106,6 +156,20 @@
   const mix = (a, b, k) => `rgb(${hex(a).map((v, i) => Math.round(v + (hex(b)[i] - v) * k)).join(',')})`;
   const chipW = (label) => Math.round(textW(label, CHIP_F) + 22);
   function chip(c, x, y, w, h, label, o = {}) {
+    if (modern()) {
+      // A rounded pill: filled teal with dark ink, or quiet glass with a hairline edge.
+      c.save();
+      if (o.down) c.translate(0, 1);
+      const face = roundPath(x, y, w, h, h / 2);
+      if (o.focus) { c.strokeStyle = HOT; c.lineWidth = 2; c.stroke(roundPath(x - 3, y - 3, w + 6, h + 6, h / 2 + 3)); }
+      c.fillStyle = o.filled ? (o.hover ? mix(ACC, '#ffffff', 0.25) : ACC) : o.hover ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.05)';
+      c.fill(face);
+      if (!o.filled) { c.strokeStyle = 'rgba(255,255,255,0.18)'; c.lineWidth = 1; c.stroke(face); }
+      c.font = CHIP_F; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillStyle = o.filled ? INK_DARK : TEXT;
+      c.fillText(String(label ?? ''), x + w / 2, y + h / 2 + 0.5);
+      c.restore();
+      return;
+    }
     c.save();
     if (o.focus) { c.strokeStyle = HOT; c.lineWidth = 2; c.stroke(steppedPath(x - 3.5, y - 3.5, w + 7, h + 9, 6)); }
     if (o.down) c.translate(0, 2);
@@ -124,5 +188,5 @@
     c.restore();
   }
 
-  R.glass = { ACC, HOT, MID, DEEP, EDGE, GLASS, TEXT, DIM, CORAL, NOTE, MONO, rgba, stepped, steppedPath, chrome, textW, typed, wrapRows, ringPts, pen, chip, chipW, CHIP_H: 23 };
+  R.glass = { ACC, HOT, MID, DEEP, EDGE, GLASS, TEXT, DIM, CORAL, NOTE, MONO, rgba, stepped, steppedPath, roundPath, chrome, textW, typed, wrapRows, ringPts, pen, chip, chipW, CHIP_H: 23 };
 })();

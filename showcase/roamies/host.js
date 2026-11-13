@@ -433,6 +433,11 @@
   window.__roamieHost = (m) => {
     Roamie.wake?.(); // the frame loop naps while the sidekick is hidden
     if (m.kind === 'speech') { Roamie.voiceOut?.handle(m); return; } // plays on, even while it changes screens
+    if (m.kind === 'speed') { Roamie.voiceOut?.setSpeed(m.v); return; }
+    // Style: retro (pixel frames) or modern (rounded, flat, sans-serif), for every bubble, card and drawing.
+    if (m.kind === 'style') { Roamie.setStyle?.(m.style); return; }
+    // Bubble only: no creature, just its bubble in the top-left corner.
+    if (m.kind === 'bubble_only') { Roamie.bubbleOnly = !!m.on; return; }
     if (held) { held.q.push(m); return; }
     if (m.kind === 'sound') { if (Roamie.sfx) Roamie.sfx.enabled = m.on; return; }
     if (m.kind === 'size') { for (const t of Roamie.tiles ?? []) t.creature.setForm?.(m.size); return; }

@@ -1,0 +1,91 @@
+/* Modern style (Settings › Appearance › Style), for the setup guide and the panel: the same layout and colours of
+   meaning, drawn flat and smooth instead of as an LED panel. Rounded frames instead of stepped pixel corners, the
+   system's sans-serif instead of Martian Mono and Doto, no dot grid, no glow, and eased motion instead of CRT and
+   dither steps. Everything here applies only under <html data-style="modern"> (set by onboarding.js and panel.js). */
+:root[data-style="modern"] {
+  --bg: #0f1216;
+  --panel: #161a20;
+  --ink: #f3f5f8;
+  --ink-2: #c5cbd3;
+  --ink-3: #8d96a3;
+  --accent: #5eead4;
+  --accent-hi: #99f6e4;
+  --accent-lo: #2dd4bf;
+  --accent-ink: #042f2a;
+  --line: #262c35;
+  --line-hi: #353d48;
+  --line-hot: #4c5664;
+  --danger: #fca5a5;
+  --display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Ubuntu, Cantarell, Arial, sans-serif;
+  --mono: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Ubuntu, Cantarell, Arial, sans-serif;
+  --radius: 10px;
+}
+/* Martian Mono is a wide face read at 87.5%; the sans is read as it is. */
+[data-style="modern"] *, [data-style="modern"] *::before, [data-style="modern"] *::after { font-stretch: normal !important; }
+[data-style="modern"] body {
+  background: radial-gradient(560px 440px at 150px 330px, rgba(94, 234, 212, 0.07), transparent 70%), var(--bg);
+  font-size: 12.5px;
+}
+
+/* ---------- frames: rounded, a hairline edge ---------- */
+[data-style="modern"] .px { clip-path: none; border-radius: var(--radius); --bw: 1px; }
+[data-style="modern"] .px::before { clip-path: none; border-radius: calc(var(--radius) - 1px); }
+[data-style="modern"] .px:focus-visible, [data-style="modern"] .px:has(:focus-visible) { --bc: var(--accent); --bw: 2px; }
+[data-style="modern"] .px:focus-visible::before, [data-style="modern"] .px:has(:focus-visible)::before { box-shadow: none; }
+
+/* ---------- type: sentence case, no tracking ---------- */
+[data-style="modern"] .btn, [data-style="modern"] .status, [data-style="modern"] .waiting, [data-style="modern"] .side-label,
+[data-style="modern"] .sub, [data-style="modern"] .looktile .name, [data-style="modern"] .wn-kind, [data-style="modern"] .count,
+[data-style="modern"] .summon.recording .caps {
+  text-transform: none; letter-spacing: 0;
+}
+[data-style="modern"] .btn { font-weight: 600; }
+[data-style="modern"] h1 { font-weight: 700; letter-spacing: -0.01em; }
+[data-style="modern"] h2 { font-weight: 600; }
+[data-style="modern"] .glyph { filter: none; }
+
+/* ---------- buttons and switches ---------- */
+[data-style="modern"] .btn.primary { box-shadow: 0 4px 14px rgba(45, 212, 191, 0.18); }
+[data-style="modern"] .switch { border-radius: 999px; }
+[data-style="modern"] .switch::before { border-radius: 999px; }
+[data-style="modern"] .switch::after {
+  top: 5px; left: 5px; width: 14px; height: 14px; border-radius: 50%;
+  transition: transform .2s var(--ease), background-color .2s var(--ease);
+}
+[data-style="modern"] .switch[aria-checked="true"]::after { box-shadow: none; background: var(--accent-ink); }
+[data-style="modern"] .switch[aria-checked="true"] { --bc: var(--accent); --fill: var(--accent); }
+
+/* ---------- lights and bars: soft dots and rounded segments, no glow ---------- */
+[data-style="modern"] .led { border-radius: 50%; }
+[data-style="modern"] .led.on { box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.18); }
+[data-style="modern"] .led.busy { animation: modern-pulse 1.2s ease-in-out infinite; }
+@keyframes modern-pulse { 50% { opacity: 0.35; } }
+[data-style="modern"] .progress li, [data-style="modern"] .dl i { border-radius: 3px; background: #232a33; }
+[data-style="modern"] .progress li.done { background: #2a9d8f; }
+[data-style="modern"] .progress li[aria-current="step"], [data-style="modern"] .dl i.on { background: var(--accent); box-shadow: none; }
+[data-style="modern"] ::-webkit-scrollbar-thumb { border-radius: 999px; }
+
+/* ---------- the panel ---------- */
+[data-style="modern"] .frame { background: var(--bg); border-radius: 12px; border-color: var(--line-hi); }
+[data-style="modern"] .side { border-right: 1px solid var(--line); }
+[data-style="modern"] .navi:hover { --fill: rgba(255, 255, 255, 0.05); }
+[data-style="modern"] .navi[aria-current="page"] { color: var(--accent); font-weight: 600; --fill: rgba(94, 234, 212, 0.12); --bc: rgba(94, 234, 212, 0.12); }
+[data-style="modern"] .navi, [data-style="modern"] .tab, [data-style="modern"] .arm > span { transition-timing-function: var(--ease); }
+[data-style="modern"] .avatar, [data-style="modern"] .maker canvas { background: none; }
+/* Opening and closing: a quick fade and settle instead of a CRT switching on and off. */
+[data-style="modern"] .frame.opening { animation: modern-open var(--open) var(--ease) both; }
+@keyframes modern-open { from { opacity: 0; transform: translateY(6px) scale(0.985); } to { opacity: 1; transform: none; } }
+[data-style="modern"] .frame.shutting { animation: modern-close var(--shut) ease-in both; }
+@keyframes modern-close { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(4px) scale(0.99); } }
+/* Rows fade up one after another instead of dissolving in through a dither. */
+[data-style="modern"] .pane.enter > *, [data-style="modern"] .pane.enter .list > li { animation: modern-row 220ms var(--ease) both; animation-delay: calc(var(--i, 0) * 22ms); }
+@keyframes modern-row { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+/* ---------- the setup guide's chat words: fade, not stepped ---------- */
+[data-style="modern"] .chat-w.in { animation: modern-row 220ms var(--ease) both; }
+[data-style="modern"] #chat-q.stale { transition: opacity 160ms ease; }
+
+@media (prefers-reduced-motion: reduce) {
+  [data-style="modern"] .frame.opening, [data-style="modern"] .frame.shutting, [data-style="modern"] .pane.enter > *,
+  [data-style="modern"] .pane.enter .list > li, [data-style="modern"] .chat-w.in, [data-style="modern"] .led.busy { animation: none; }
+}

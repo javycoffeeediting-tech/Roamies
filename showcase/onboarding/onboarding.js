@@ -564,9 +564,11 @@
       $('fish-change').setAttribute('aria-expanded', String(replies.changing));
       $('fish-save').disabled = replies.saving;
       $('fish-save').textContent = replies.saving ? 'Checking…' : 'Save';
-      // Talking hands-free (needs voice): open the mic for an answer, and on macOS, wake on "Hey Roamies".
+      // Talking hands-free (needs voice): open the mic for an answer, and wake on "Hey Roamies" (on Windows and
+      // Linux, on the phrases set in the panel).
       $('talk-rows').hidden = !state?.voice;
-      $('wake-row').hidden = !isMac();
+      $('wake-row').hidden = !(state?.wakeOk ?? isMac());
+      $('wake-hint').textContent = `Say ${state?.wakeSay ?? '“Hey Roamies”'} to talk. Mic stays on.`;
       $('autolisten-switch').setAttribute('aria-checked', String(!!state?.autoListen));
       $('wake-switch').setAttribute('aria-checked', String(!!state?.wakeWord));
       nav();
@@ -1267,6 +1269,8 @@
       case 'state': {
         const first = !state;
         state = msg;
+        // Style (Settings › Appearance): modern.css restyles everything when this says modern.
+        document.documentElement.dataset.style = msg.style === 'modern' ? 'modern' : 'retro';
         if (Roamie.sfx) Roamie.sfx.enabled = msg.sound !== false;
         if (first) { sidekick.setLook?.(msg.look); sidekick.setForm?.(msg.size); }
         if (at('welcome')) look.render();

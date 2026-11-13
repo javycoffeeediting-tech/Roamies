@@ -30,7 +30,7 @@ function request(msg, signal) {
   });
 }
 
-let allow = true, agent = null, route = 'api', started = false;
+let allow = true, auto = false, agent = null, route = 'api', started = false;
 const queued = [];
 function steer(text) {
   const t = `(Message from the user while you work: ${text})`;
@@ -43,7 +43,7 @@ process.on('message', (m) => {
   if (m?.t === 'start' && !started) { started = true; run(m).catch((e) => end(false, String(e?.message ?? e).slice(0, 300))); }
   else if (m?.t === 'reply') { const r = waiting.get(m.id); waiting.delete(m.id); r?.(m.value ?? null); }
   else if (m?.t === 'steer' && typeof m.text === 'string') steer(m.text.slice(0, 2000));
-  else if (m?.t === 'allow') allow = !!m.on;
+  else if (m?.t === 'allow') { allow = !!m.on; auto = !!m.auto; }
 });
 
 function end(ok, error) {
@@ -64,11 +64,11 @@ export function trimRun(msgs, budgetChars) {
 }
 
 async function run({ agent: a, model: md, content }) {
-  allow = a.allow !== false;
+  allow = a.allow !== false; auto = a.auto === true;
   route = md.route === 'claude-code' ? 'claude-code' : 'api';
   let result = null;
   const { tools: all } = createTools({
-    allowActions: () => allow, ui: () => {}, openUrl: () => {}, onCommitments: () => {}, showList: () => {}, fmtWhen: (ms) => new Date(ms).toLocaleString(),
+    allowActions: () => allow, autoAllow: () => auto, ui: () => {}, openUrl: () => {}, onCommitments: () => {}, showList: () => {}, fmtWhen: (ms) => new Date(ms).toLocaleString(),
     commitmentsText: () => '', userName: a.userName || 'The user', workdir: a.dir, own: a.dir,
     ask: (opts, signal) => request({ t: 'ask', question: String(opts?.placeholder ?? '').slice(0, 300) }, signal).then((yes) => (yes ? 'yes' : null)),
     // web_search's side search runs on the same Anthropic sign-in as this agent; other providers use the keyless engines.

@@ -8,6 +8,13 @@
 // what was said, as on macOS (Windows only). On Wayland no app can watch the keyboard, so there {"cmd":"toggle"}
 // (sent for `roamies --talk`, which people bind to a key) starts a take, and sends it when it comes again or on a
 // pause. Exits when stdin closes.
+// With the wake word on ({"cmd":"wake","on":true,"words":[…]}), it also listens quietly while idle: each burst of
+// speech is read by Parakeet on this PC, and one of the wake phrases at its start turns it into a hands-free take
+// (wake.rs). Held off while Roamies answers ({"cmd":"wake_hold"}), so it can't wake itself.
+// With "send when I pause" on ({"cmd":"pause_sends"}), a held take also sends once the talking stops.
+// End words ({"cmd":"end_words","words":["over","go"]}): one said last sends the take at once, without it.
+// Cancel words ({"cmd":"cancel_words","words":["cancel","never mind"]}): one said last drops the whole take, nothing sent.
+// {"cmd":"listen","quiet":3} listens hands-free and lets go after 3 s with nothing said (listening after a reply).
 //
 // roamies-voice --model <dir> [--chord control,option]   normal use (Roamies starts it)
 // roamies-voice --perms                                   prints {"type":"perms","mic":…}
@@ -18,6 +25,7 @@
 mod audio;
 mod ink;
 mod keys;
+mod wake;
 
 use audio::{MicError, Sink, Source};
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
@@ -126,6 +134,8 @@ fn spawn_engine(dir: PathBuf, tx: Sender<Ev>) -> (Sender<Job>, thread::JoinHandl
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Phase {
     Idle,
+    // Listening quietly for a wake phrase (no pill, no level); hearing one turns into a hands-free take.
+    Wake,
     Armed,
     Holding,
     HandsFree,
@@ -144,6 +154,19 @@ const READ_EVERY: f64 = 0.8;
 // Parakeet makes up words ("Thank you.") from silence, so a take is only read once the mic heard a voice:
 // about -49 dBFS, above room noise and below quiet speech.
 const SPEECH_LEVEL: f64 = 0.15;
+// Words stopped changing this long, and a read since then heard no more: the talking is over even if the room is
+// loud enough to keep the level up (a fan, music, a busy office).
+const STILL_ENDS: f64 = 2.2;
+// Wake listening: the sound kept from before the speech starts (so the phrase's first sound isn't cut), how long a
+// pause ends a burst that had no phrase in it, the longest burst read, and the rest after each take.
+const WAKE_PREROLL: f64 = 0.6;
+const WAKE_PAUSE: f64 = 1.2;
+const WAKE_MAX: f64 = 6.0;
+const WAKE_COOLDOWN: f64 = 2.0;
+// Hands-free with nothing said: let go after this long (unless asked for less), and never later than this past it
+// even if the room stays loud.
+const NOTHING_HEARD: f64 = 8.0;
+const LOUD_GRACE: f64 = 5.0;
 
 struct Voice {
     phase: Phase,
@@ -174,6 +197,26 @@ struct Voice {
     ink: ink::Ink,
     tx: Sender<Ev>,
     t0: Instant,
+    // When the last live read came back (pause detection in a loud room).
+    read_done_at: f64,
+    // A held take sends on a pause too.
+    pause_sends: bool,
+    // Wake word: on in settings, its phrases, held off while Roamies answers, and resting after a take or a failure.
+    wake_on: bool,
+    wake_phrases: Vec<wake::Phrase>,
+    wake_hold: bool,
+    wake_cooldown_until: f64,
+    wake_retry_at: f64,
+    // The take began with a wake phrase: it's taken off what was said.
+    woke: bool,
+    wake_text: String,
+    // Words that, said last, send the take straight away (lowercase, letters and digits only, per word).
+    end_words: Vec<Vec<String>>,
+    ended_by_word: bool,
+    // Words that, said last, drop the take: nothing is sent.
+    cancel_words: Vec<Vec<String>>,
+    // A hands-free take with nothing said ends after this long (shorter when listening after a reply).
+    quiet_limit: f64,
 }
 
 impl Voice {
@@ -206,6 +249,19 @@ impl Voice {
             ink: ink::Ink::default(),
             tx,
             t0: Instant::now(),
+            read_done_at: 0.0,
+            pause_sends: false,
+            wake_on: false,
+            wake_phrases: wake::phrases(&["Hey Roamies".to_owned()]),
+            wake_hold: false,
+            wake_cooldown_until: 0.0,
+            wake_retry_at: 0.0,
+            woke: false,
+            wake_text: String::new(),
+            end_words: Vec::new(),
+            ended_by_word: false,
+            cancel_words: Vec::new(),
+            quiet_limit: NOTHING_HEARD,
         }
     }
 
@@ -215,7 +271,9 @@ impl Voice {
 
     fn set_chord(&mut self, names: &[String]) {
         let Some(m) = keys::mask(names) else { return log(&format!("ignored chord {names:?}")) };
-        if self.phase != Phase::Idle {
+        if self.phase == Phase::Wake {
+            self.stop_wake();
+        } else if self.phase != Phase::Idle {
             self.cancel();
         }
         self.chord = m;
@@ -229,6 +287,8 @@ impl Voice {
         self.ink.set_armed(matches!(self.phase, Phase::Armed | Phase::Holding), now);
         self.ink.follow(now);
         match self.phase {
+            Phase::Idle if self.wake_allowed(now) => self.start_wake(now),
+            Phase::Wake => self.wake_tick(now),
             Phase::Holding | Phase::HandsFree => self.maybe_read(now),
             Phase::Finishing => {
                 if self.tail_until.is_some_and(|t| now >= t) {
@@ -263,8 +323,9 @@ impl Voice {
         };
 
         match self.phase {
-            Phase::Idle => {
+            Phase::Idle | Phase::Wake => {
                 if chord && !prev && !self.blocked {
+                    self.stop_wake();
                     self.arm(now);
                 }
             }
@@ -286,6 +347,10 @@ impl Voice {
                 if released {
                     self.end("released", now);
                     self.finish();
+                } else if self.pause_sends && self.paused(now) {
+                    // Still holding the keys, but done talking: send it now. Letting go later starts nothing new.
+                    self.end("pause (keys held)", now);
+                    self.finish();
                 } else if now - self.listen_at > MAX_SESSION {
                     self.end("max length", now);
                     self.finish();
@@ -298,11 +363,14 @@ impl Voice {
                     self.released_at = None;
                     return;
                 }
-                let quiet = now - self.heard_at.max(self.voice_at);
-                if !self.best.is_empty() && quiet > PAUSE_ENDS {
+                if self.paused(now) {
                     self.end("pause", now);
                     self.finish();
-                } else if self.best.is_empty() && !self.reading && now - self.listen_at > 8.0 && now - self.voice_at > PAUSE_ENDS {
+                } else if self.best.is_empty()
+                    && !self.reading
+                    && now - self.listen_at > self.quiet_limit
+                    && (now - self.voice_at > PAUSE_ENDS.min(self.quiet_limit / 2.0) || now - self.listen_at > self.quiet_limit + LOUD_GRACE)
+                {
                     self.end("nothing heard", now);
                     self.cancel();
                 } else if now - self.listen_at > MAX_SESSION {
@@ -318,11 +386,24 @@ impl Voice {
         log(&format!("session end: {why} after {:.1}s", now - self.listen_at));
     }
 
+    /// Done talking: some words came, then either the mic went quiet, or (in a loud room, where the level never
+    /// drops) the words stopped changing and a read since then heard nothing new.
+    fn paused(&self, now: f64) -> bool {
+        if self.best.is_empty() {
+            return false;
+        }
+        let quiet = now - self.heard_at.max(self.voice_at) > PAUSE_ENDS;
+        let still = now - self.heard_at > STILL_ENDS && self.read_done_at - self.heard_at > STILL_ENDS - READ_EVERY;
+        quiet || still
+    }
+
     fn arm(&mut self, now: f64) {
         self.phase = Phase::Armed;
         self.chord_at = now;
         self.best.clear();
         self.spoke = false;
+        self.ended_by_word = false;
+        self.quiet_limit = NOTHING_HEARD;
         self.take += 1;
         self.reading = false;
         self.read_len = 0;
@@ -427,6 +508,36 @@ impl Voice {
         }
         if !last {
             self.reading = false;
+            self.read_done_at = self.now();
+        }
+        if self.phase == Phase::Wake {
+            return self.heard_while_waiting(text);
+        }
+        // A take started by a wake phrase: the phrase itself isn't part of what was said.
+        let text = if self.woke { wake::strip(&self.wake_phrases, &text) } else { text };
+        // A cancel word said last ("…, never mind"): drop the whole take, live or at its closing read.
+        if matches!(self.phase, Phase::Holding | Phase::HandsFree | Phase::Finishing) && wake::ends_with_word(&self.cancel_words, &text) {
+            let now = self.now();
+            self.end("cancel word", now);
+            return self.cancel();
+        }
+        // An end word said last: what came before it is the whole request, sent now.
+        let cut = wake::cut_end_word(&self.end_words, &text);
+        let had_cut = cut.is_some();
+        let text = match cut {
+            Some(c) => c,
+            // Ended by an end word, but the closing read heard a little more after it: keep what the live read had.
+            None if last && self.ended_by_word => self.best.clone(),
+            None => text,
+        };
+        if had_cut && !self.ended_by_word && matches!(self.phase, Phase::Holding | Phase::HandsFree) && !text.is_empty() {
+            self.ended_by_word = true;
+            self.best = text.clone();
+            self.heard_at = self.now();
+            emit(json!({ "type": "partial", "text": self.best }));
+            let now = self.now();
+            self.end("end word", now);
+            self.finish();
         }
         // A closing read that came back empty keeps whatever the live reads heard.
         if !text.is_empty() && text != self.best {
@@ -465,6 +576,7 @@ impl Voice {
         self.final_until = None;
         self.take += 1;
         self.phase = Phase::Idle;
+        self.rest_wake();
         let text = self.best.trim().to_string();
         let area = self.ink.take();
         if !text.is_empty() {
@@ -498,13 +610,152 @@ impl Voice {
         self.reading = false;
         self.phase = Phase::Idle;
         self.report_empty = false;
+        self.rest_wake();
         let now = self.now();
         self.ink.clear(now);
         emit(json!({ "type": "state", "state": "idle", "cancelled": true }));
     }
 
+    // ---------- wake word ----------
+
+    fn set_wake(&mut self, on: bool, words: Option<Vec<String>>) {
+        if let Some(words) = words {
+            let phrases = wake::phrases(&words);
+            if phrases != self.wake_phrases {
+                log(&format!("wake phrases: {}", phrases.len()));
+                self.wake_phrases = phrases;
+            }
+        }
+        if on != self.wake_on {
+            log(&format!("wake word {}", if on { "on" } else { "off" }));
+            self.wake_on = on;
+        }
+        if !self.wake_on || self.wake_phrases.is_empty() {
+            self.stop_wake();
+        }
+    }
+
+    fn set_wake_hold(&mut self, on: bool) {
+        if on != self.wake_hold && self.wake_on {
+            log(if on { "wake: paused while Roamies answers" } else { "wake: resumed" });
+        }
+        self.wake_hold = on;
+        if on {
+            self.stop_wake();
+        }
+    }
+
+    /// After a take (sent or dropped): rest a moment before listening for the phrase again.
+    fn rest_wake(&mut self) {
+        self.woke = false;
+        self.wake_cooldown_until = self.now() + WAKE_COOLDOWN;
+    }
+
+    // Never asks for anything: wake listening starts only with the model loaded and the microphone allowed.
+    fn wake_allowed(&self, now: f64) -> bool {
+        self.wake_on
+            && !self.wake_hold
+            && !self.wake_phrases.is_empty()
+            && self.engine.is_some()
+            && now >= self.wake_cooldown_until
+            && now >= self.wake_retry_at
+    }
+
+    fn start_wake(&mut self, now: f64) {
+        // If the mic won't open, try again in a while rather than every frame.
+        self.wake_retry_at = now + 30.0;
+        if !keys::mic_allowed() {
+            return;
+        }
+        self.take += 1;
+        self.reset_burst(now);
+        self.buf.lock().unwrap().clear();
+        let sink = Sink::new(self.buf.clone(), self.tx.clone());
+        let started = match &self.test_audio {
+            Some(p) => audio::play_file(p, sink).map_err(|e| MicError::new("failed", e)),
+            None => audio::open_mic(sink),
+        };
+        match started {
+            // Wake listening fails quietly: no error for the user, who didn't ask for anything just now.
+            Err(e) => log(&format!("wake: couldn't open the mic: {} ({})", e.detail, e.reason)),
+            Ok(s) => {
+                self.source = Some(s);
+                self.phase = Phase::Wake;
+                self.wake_retry_at = 0.0;
+                log("wake: listening");
+            }
+        }
+    }
+
+    fn stop_wake(&mut self) {
+        if self.phase != Phase::Wake {
+            return;
+        }
+        self.stop_audio();
+        self.buf.lock().unwrap().clear();
+        self.take += 1;
+        self.reading = false;
+        self.phase = Phase::Idle;
+    }
+
+    // Start fresh for the next thing said: no speech yet, nothing read.
+    fn reset_burst(&mut self, now: f64) {
+        self.spoke = false;
+        self.reading = false;
+        self.read_len = 0;
+        self.read_at = now;
+        self.voice_at = now;
+        self.heard_at = now;
+        self.wake_text.clear();
+        self.best.clear();
+    }
+
+    // While waiting: keep a moment of sound from before any speech, read each burst of speech as it grows, and
+    // let it go after a pause (or once it's long) when it didn't start with a phrase.
+    fn wake_tick(&mut self, now: f64) {
+        if !self.spoke {
+            let keep = (WAKE_PREROLL * RATE as f64) as usize;
+            let mut buf = self.buf.lock().unwrap();
+            if buf.len() > keep * 2 {
+                let cut = buf.len() - keep;
+                buf.drain(..cut);
+            }
+            return;
+        }
+        let len = self.buf.lock().unwrap().len();
+        let ended = now - self.voice_at > WAKE_PAUSE && !self.reading;
+        if ended || len as f64 > WAKE_MAX * RATE as f64 {
+            if !self.wake_text.is_empty() {
+                log(&format!("wake: heard {} words, not a phrase", self.wake_text.split_whitespace().count()));
+            }
+            self.take += 1; // a read still under way is for the burst that's gone
+            self.reset_burst(now);
+            self.buf.lock().unwrap().clear();
+            return;
+        }
+        self.maybe_read(now);
+    }
+
+    fn heard_while_waiting(&mut self, text: String) {
+        if text == self.wake_text {
+            return;
+        }
+        self.wake_text = text;
+        let Some(hit) = wake::find(&self.wake_phrases, &self.wake_text) else { return };
+        let now = self.now();
+        log(&format!("wake: heard phrase {} (distance {})", hit.phrase + 1, hit.distance));
+        // Same mic, same take: what follows the phrase is already the start of what's said.
+        self.woke = true;
+        self.phase = Phase::HandsFree;
+        self.chord_at = now;
+        self.best = hit.rest;
+        self.blocked = true; // keys held right now aren't a tap on the talk chord
+        self.show_listening("wake", now);
+    }
+
     /// Start listening hands-free without a key press (after an area snap). Ends on a pause or a tap.
     fn listen_now(&mut self) {
+        self.stop_wake();
         if self.phase != Phase::Idle {
             return;
         }
@@ -519,7 +770,7 @@ impl Voice {
     /// hands-free, the next one sends what was said (so does a pause).
     fn toggle(&mut self) {
         match self.phase {
-            Phase::Idle => self.listen_now(),
+            Phase::Idle | Phase::Wake => self.listen_now(),
             Phase::Armed | Phase::Holding | Phase::HandsFree => {
                 let now = self.now();
                 self.end("toggled", now);
@@ -542,12 +793,33 @@ impl Voice {
         match ev {
             Ev::Cmd(msg) => match msg.get("cmd").and_then(Value::as_str) {
                 Some("cancel") => self.external_cancel(),
-                Some("listen") => self.listen_now(),
+                Some("listen") => {
+                    self.listen_now();
+                    if let Some(q) = msg.get("quiet").and_then(Value::as_f64).filter(|q| *q >= 1.0) {
+                        self.quiet_limit = q;
+                    }
+                }
+                Some("cancel_words") => {
+                    let words: Vec<String> = msg.get("words").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                    self.cancel_words = wake::end_words(&words);
+                    log(&format!("cancel words: {}", self.cancel_words.len()));
+                }
+                Some("end_words") => {
+                    let words: Vec<String> = msg.get("words").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+                    self.end_words = wake::end_words(&words);
+                    log(&format!("end words: {}", self.end_words.len()));
+                }
                 Some("toggle") => self.toggle(),
                 Some("chord") => {
                     let mods: Vec<String> = msg.get("mods").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default();
                     self.set_chord(&mods);
                 }
+                Some("wake") => {
+                    let words = msg.get("words").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect());
+                    self.set_wake(msg.get("on").and_then(Value::as_bool) == Some(true), words);
+                }
+                Some("wake_hold") => self.set_wake_hold(msg.get("on").and_then(Value::as_bool) == Some(true)),
+                Some("pause_sends") => self.pause_sends = msg.get("on").and_then(Value::as_bool) == Some(true),
                 // Muting the speakers while listening is macOS-only for now.
                 _ => {}
             },
@@ -558,12 +830,17 @@ impl Voice {
                 if matches!(self.phase, Phase::Armed | Phase::Holding | Phase::HandsFree) {
                     emit(mic_error(&e));
                     self.cancel();
+                } else if self.phase == Phase::Wake {
+                    // Quietly: try again in a while (a mic plugged back in, or another one made the default).
+                    self.stop_wake();
+                    self.wake_retry_at = self.now() + 30.0;
                 }
             }
             Ev::Text { take, text, last } => self.on_text(take, text, last),
             Ev::EngineFailed(e) => {
                 self.engine = None;
                 self.engine_error = Some(e);
+                self.stop_wake();
             }
         }
         false
@@ -720,6 +997,193 @@ mod tests {
         v.tick();
         assert!(jobs.try_recv().is_err(), "silence isn't read (Parakeet makes words up from it)");
         assert_eq!(v.phase, Phase::Idle);
+        let _ = std::fs::remove_file(wav);
+    }
+
+    // Wake listening is on with the given phrases, and the test file stands in for the room.
+    fn waiting(words: &[&str]) -> (Voice, Receiver<Job>, PathBuf) {
+        let (mut v, jobs, wav) = voice();
+        v.set_wake(true, Some(words.iter().map(|s| s.to_string()).collect()));
+        v.tick();
+        assert_eq!(v.phase, Phase::Wake, "idle with the wake word on: listening for the phrase");
+        assert!(v.source.is_some(), "the microphone is on");
+        (v, jobs, wav)
+    }
+
+    #[test]
+    fn a_wake_phrase_starts_a_hands_free_take_without_the_phrase() {
+        let (mut v, jobs, wav) = waiting(&["Hey Jarvis"]);
+        v.on_text(v.take, "so anyway".into(), false);
+        assert_eq!(v.phase, Phase::Wake, "other words don't wake it");
+        v.on_text(v.take, "Hey Jarvis, open".into(), false);
+        assert_eq!(v.phase, Phase::HandsFree, "the phrase starts a take");
+        assert!(v.source.is_some(), "on the same microphone");
+        assert_eq!(v.best, "open", "what came after the phrase is the start of it");
+        // Later reads of the whole take still begin with the phrase; it's taken off each time.
+        v.on_text(v.take, "Hey Jarvis, open Chrome".into(), false);
+        assert_eq!(v.best, "open Chrome");
+        v.end("test", 0.0);
+        v.finish();
+        v.tail_until = Some(0.0);
+        v.spoke = true;
+        v.tick();
+        let job = jobs.try_iter().find(|j| j.last).expect("a closing read");
+        v.on_text(job.take, "Hey Jarvis, open Chrome please.".into(), true);
+        assert_eq!(v.phase, Phase::Idle);
+        assert_eq!(v.best, "open Chrome please.");
+        assert!(!v.woke);
+        v.tick();
+        assert_eq!(v.phase, Phase::Idle, "it rests a moment before listening again");
+        v.wake_cooldown_until = 0.0;
+        v.tick();
+        assert_eq!(v.phase, Phase::Wake, "then listens for the phrase again");
+        let _ = std::fs::remove_file(wav);
+    }
+
+    #[test]
+    fn wake_listening_waits_while_roamies_answers_and_stops_when_turned_off() {
+        let (mut v, _jobs, wav) = waiting(&["Hey Roamies"]);
+        v.set_wake_hold(true);
+        assert_eq!(v.phase, Phase::Idle, "held: the mic is off");
+        assert!(v.source.is_none());
+        v.tick();
+        assert_eq!(v.phase, Phase::Idle, "and stays off while held");
+        v.set_wake_hold(false);
+        v.tick();
+        assert_eq!(v.phase, Phase::Wake);
+        v.set_wake(false, None);
+        assert_eq!(v.phase, Phase::Idle);
+        assert!(v.source.is_none());
+        v.set_wake(true, Some(vec!["   ".into()]));
+        v.tick();
+        assert_eq!(v.phase, Phase::Idle, "no phrases, nothing to listen for");
+        let _ = std::fs::remove_file(wav);
+    }
+
+    #[test]
+    fn a_burst_without_the_phrase_is_let_go_after_a_pause() {
+        let (mut v, jobs, wav) = waiting(&["Hey Roamies"]);
+        v.on_level(0.5);
+        v.buf.lock().unwrap().extend(vec![0.1; RATE as usize]);
+        v.read_at = -10.0;
+        v.tick();
+        let job = jobs.try_recv().expect("speech is read for the phrase");
+        assert!(!job.last);
+        v.on_text(job.take, "turn the music down".into(), false);
+        assert_eq!(v.phase, Phase::Wake);
+        v.voice_at = v.now() - WAKE_PAUSE - 0.1;
+        v.tick();
+        assert!(!v.spoke && v.wake_text.is_empty(), "a fresh start for the next thing said");
+        let old = job.take;
+        v.on_text(old, "Hey Roamies".into(), false);
+        assert_eq!(v.phase, Phase::Wake, "a late read of the old burst can't wake it");
+        let _ = std::fs::remove_file(wav);
+    }
+
+    #[test]
+    fn a_held_take_sends_on_a_pause_when_asked() {
+        let (mut v, _jobs, wav) = voice();
+        v.arm(v.now());
+        v.phase = Phase::Holding;
+        let now = v.now();
+        v.show_listening("hold", now);
+        v.on_level(0.5);
+        v.on_text(v.take, "what's the time".into(), false);
+        v.heard_at -= 3.0;
+        v.voice_at -= 3.0;
+        // tick_keys reads the real keyboard; nothing is held in a test, and the first frame of a release doesn't
+        // count yet (the debounce), so this frame is decided by the pause alone.
+        v.tick_keys(v.now());
+        assert_eq!(v.phase, Phase::Holding, "off by default: holding the keys keeps listening");
+        v.released_at = None;
+        v.pause_sends = true;
+        v.tick_keys(v.now());
+        assert_eq!(v.phase, Phase::Finishing, "on: done talking sends it");
+        let _ = std::fs::remove_file(wav);
+    }
+
+    #[test]
+    fn an_end_word_sends_at_once_without_it() {
+        let (mut v, jobs, wav) = voice();
+        v.handle(Ev::Cmd(json!({ "cmd": "end_words", "words": ["over", "go"] })));
+        v.toggle();
+        v.on_level(0.5);
+        v.on_text(v.take, "open my".into(), false);
+        assert_eq!(v.phase, Phase::HandsFree);
+        v.on_text(v.take, "open my email, go.".into(), false);
+        assert_eq!(v.phase, Phase::Finishing, "the end word ends it straight away");
+        assert_eq!(v.best, "open my email");
+        v.tail_until = Some(0.0);
+        v.tick();
+        let job = jobs.try_iter().find(|j| j.last).expect("a closing read");
+        // The closing read heard a breath after it: what the live read had stands.
+        v.on_text(job.take, "Open my email, go. Uh".into(), true);
+        assert_eq!(v.phase, Phase::Idle);
+        assert_eq!(v.best, "open my email");
+        let _ = std::fs::remove_file(wav);
+    }
+
+    #[test]
+    fn a_cancel_word_drops_the_take_and_sends_nothing() {
+        let (mut v, jobs, wav) = voice();
+        v.handle(Ev::Cmd(json!({ "cmd": "cancel_words", "words": ["cancel", "never mind"] })));
+        v.handle(Ev::Cmd(json!({ "cmd": "end_words", "words": ["over"] })));
+        v.toggle();
+        v.on_level(0.5);
+        v.on_text(v.take, "open my email".into(), false);
+        assert_eq!(v.phase, Phase::HandsFree);
+        v.on_text(v.take, "open my email, never mind.".into(), false);
+        assert_eq!(v.phase, Phase::Idle, "dropped at once");
+        assert!(v.source.is_none(), "the microphone is off");
+        assert!(jobs.try_iter().all(|j| !j.last), "no closing read: nothing is sent");
+        // Said just before letting go, it's caught at the closing read instead.
+        v.toggle();
+        v.on_level(0.5);
+        v.on_text(v.take, "open my".into(), false);
+        v.end("test", 0.0);
+        v.finish();
+        v.tail_until = Some(0.0);
+        v.tick();
+        let job = jobs.try_iter().find(|j| j.last).expect("a closing read");
+        v.on_text(job.take, "Open my email. Cancel.".into(), true);
+        assert_eq!(v.phase, Phase::Idle);
+        let _ = std::fs::remove_file(wav);
+    }
+
+    #[test]
+    fn listening_after_a_reply_lets_go_after_a_short_quiet() {
+        let (mut v, _jobs, wav) = voice();
+        v.handle(Ev::Cmd(json!({ "cmd": "listen", "quiet": 3 })));
+        assert_eq!(v.phase, Phase::HandsFree);
+        assert_eq!(v.quiet_limit, 3.0);
+        v.listen_at -= 2.0;
+        v.voice_at -= 2.0;
+        v.released_at = None;
+        v.tick_keys(v.now());
+        assert_eq!(v.phase, Phase::HandsFree, "2 s in: still listening");
+        v.listen_at -= 1.5;
+        v.voice_at -= 1.5;
+        v.tick_keys(v.now());
+        assert_eq!(v.phase, Phase::Idle, "3 s of nothing: the mic closes");
+        // A key tap afterwards gets the usual 8 s.
+        v.arm(v.now());
+        assert_eq!(v.quiet_limit, NOTHING_HEARD);
+        let _ = std::fs::remove_file(wav);
+    }
+
+    #[test]
+    fn a_loud_room_still_ends_when_the_words_stop() {
+        let (mut v, _jobs, wav) = voice();
+        v.best = "open my email".into();
+        let now = v.now();
+        v.voice_at = now; // the fan keeps the level up
+        v.heard_at = now - 3.0;
+        v.read_done_at = now - 3.0 + 0.5;
+        assert!(!v.paused(now), "the last read was right after the words: maybe still talking");
+        v.read_done_at = now - 0.1;
+        assert!(v.paused(now), "a read since then heard no more words");
+        v.best.clear();
+        assert!(!v.paused(now), "nothing said yet: keep listening");
         let _ = std::fs::remove_file(wav);
     }
 

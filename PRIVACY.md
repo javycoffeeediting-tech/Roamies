@@ -49,6 +49,12 @@ Each provider's own privacy policy applies to what is sent to it.
   "Hey Roamies", and macOS shows its microphone dot the whole time. That audio is turned into text only on your Mac
   (it never starts on a Mac that would need Apple's servers). Nothing is kept or sent anywhere until you say the phrase;
   the log notes only when it heard speech and how close that came to the phrase, never what was said.
+- **Wake word (Windows and Linux, off by default):** the same, with your own wake phrases. While it waits, each burst of
+  speech is turned into text on your PC by the same speech model as talking (Parakeet), checked for a phrase and then
+  thrown away; Windows shows that an app is using the microphone the whole time. The log notes only when it heard
+  speech and which phrase woke it, never what was said.
+- **Prompt history (on by default, Behavior page):** every request you make, spoken or typed, is added with the time
+  to `Roamies\prompt_history.txt` in your home folder. It stays on your computer; turn it off with Keep prompt history.
 - The screen is captured only when Roamies answers something about your screen, or when you mark an area. On Linux
   with Wayland it's taken through your desktop's screenshot portal; the copy the portal saves is deleted right away.
 

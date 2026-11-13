@@ -1,6 +1,7 @@
 // Plays spoken replies: 16-bit mono PCM chunks from the brain (Fish Audio), scheduled back to back so a
 // reply plays without gaps or clicks. A new reply's id replaces the old one at once; "stop" fades out fast.
-// level() is the live loudness, for the body to move with the voice.
+// level() is the live loudness, for the body to move with the voice. setSpeed() plays replies faster or slower at the
+// same pitch (stretch.js), from the next chunk on.
 (() => {
   const R = window.Roamie;
   const LEAD = 0.12; // cushion before a reply's first chunk, so the next chunk is never late
@@ -8,6 +9,8 @@
   // How fast the voice talks (characters a second), learned from each whole reply: its audio length against how much
   // text it said. Drawings pace their marks to it (ink.js).
   let rate = 15, secs = 0;
+  // Voice speed (Settings › Voice): 1 plays as sent; otherwise each reply goes through its own stretcher.
+  let speed = 1, st = null;
   // Replies that are over: their end arrived, or they were stopped or replaced (auto-listen waits for this).
   const over = new Set();
   const isOver = (x) => { over.add(x); if (over.size > 20) over.delete(over.values().next().value); };
@@ -25,27 +28,26 @@
     return ac;
   };
 
-  const pcm = (b64, rate) => {
+  const decode = (b64) => {
     const raw = atob(b64), n = raw.length >> 1, f = new Float32Array(n);
     for (let i = 0; i < n; i++) { let v = raw.charCodeAt(2 * i) | (raw.charCodeAt(2 * i + 1) << 8); if (v > 32767) v -= 65536; f[i] = v / 32768; }
-    const b = ac.createBuffer(1, Math.max(1, n), rate);
-    b.getChannelData(0).set(f);
-    return b;
+    return f;
   };
 
   const stop = () => {
     if (id) isOver(id);
-    id = null; endAt = 0;
+    id = null; endAt = 0; st = null;
     if (!ac || !live.length) return;
     const t = ac.currentTime, old = live; live = [];
     out.gain.cancelScheduledValues(t); out.gain.setValueAtTime(out.gain.value, t); out.gain.linearRampToValueAtTime(0, t + 0.04);
     for (const s of old) { try { s.stop(t + 0.05); } catch { /* not started */ } }
   };
 
-  const play = (m) => {
-    const a = ctx();
-    if (m.id !== id) { stop(); id = m.id; secs = 0; }
-    const b = pcm(m.pcm, m.rate || 44100), s = a.createBufferSource();
+  // Samples onto the end of what's already scheduled.
+  const queue = (f, sr) => {
+    if (!f.length) return;
+    const a = ctx(), b = a.createBuffer(1, f.length, sr), s = a.createBufferSource();
+    b.getChannelData(0).set(f);
     s.buffer = b; s.connect(out);
     const now = a.currentTime;
     if (!live.length) { out.gain.cancelScheduledValues(now); out.gain.setValueAtTime(1, now); }
@@ -55,10 +57,23 @@
     s.onended = () => { live = live.filter((x) => x !== s); };
   };
 
+  const play = (m) => {
+    ctx();
+    if (m.id !== id) { stop(); id = m.id; secs = 0; }
+    const sr = m.rate || 44100;
+    let f = decode(m.pcm);
+    if (speed !== 1 && R.stretcher) {
+      if (!st || st.sr !== sr) st = R.stretcher(sr, speed);
+      f = st.push(f);
+    }
+    queue(f, sr);
+  };
+
   R.voiceOut = {
     handle(m) {
       if (m.stop) return stop();
-      if (m.end) { // the last chunk is already scheduled
+      if (m.end) { // the last chunk is already scheduled (with the speed changed, what the stretcher still holds goes now)
+        if (m.id === id && st) { queue(st.flush(), st.sr); st = null; }
         isOver(m.id);
         if (m.id === id && m.chars > 20 && secs > 1) rate = Math.min(30, Math.max(8, rate * 0.6 + (m.chars / secs) * 0.4));
         return;
@@ -79,5 +94,6 @@
       return (lv += (v - lv) * (v > lv ? 0.5 : 0.15));
     },
     stop,
+    setSpeed(v) { const n = Number(v); speed = n >= 0.5 && n <= 2 ? n : 1; },
   };
 })();

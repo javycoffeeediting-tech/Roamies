@@ -1573,7 +1573,8 @@ fn handle_sidecar(app: &AppHandle, msg: Value) {
             WRITE_CHORD.store(write.unwrap_or(0), Ordering::Relaxed);
         }
         // Listen right away, hands-free (after an area snap: snap, then just talk).
-        Some("listen") => to_voice(app, &json!({ "cmd": "listen" })),
+        // quiet: let go after that many seconds with nothing said (listening after a reply).
+        Some("listen") => to_voice(app, &json!({ "cmd": "listen", "quiet": msg.get("quiet") })),
         // Linux: the sidecar's screenshot and copy go through the shell (GTK, X11 and the desktop portal).
         #[cfg(target_os = "linux")]
         Some("screenshot") => {
@@ -1606,7 +1607,17 @@ fn handle_sidecar(app: &AppHandle, msg: Value) {
                 let sound = msg.get("sound").and_then(Value::as_bool).unwrap_or(true);
                 to_voice(app, &json!({ "cmd": "sound", "on": sound }));
                 let wake = msg.get("wake").and_then(Value::as_bool).unwrap_or(false);
-                to_voice(app, &json!({ "cmd": "wake", "on": wake }));
+                // Windows and Linux: the user's own wake phrases (the Mac helper listens for "Hey Roamies").
+                let words = msg.get("wakeWords").filter(|w| w.is_array()).cloned().unwrap_or(Value::Null);
+                to_voice(app, &json!({ "cmd": "wake", "on": wake, "words": words }));
+                let pause = msg.get("pauseSends").and_then(Value::as_bool).unwrap_or(false);
+                to_voice(app, &json!({ "cmd": "pause_sends", "on": pause }));
+                // Words that, said last, send the take at once ("over", "go").
+                let ends = msg.get("endWords").filter(|w| w.is_array()).cloned().unwrap_or_else(|| json!([]));
+                to_voice(app, &json!({ "cmd": "end_words", "words": ends }));
+                // Words that, said last, drop the take ("cancel", "never mind").
+                let cancels = msg.get("cancelWords").filter(|w| w.is_array()).cloned().unwrap_or_else(|| json!([]));
+                to_voice(app, &json!({ "cmd": "cancel_words", "words": cancels }));
             } else {
                 stop_voice(app);
             }

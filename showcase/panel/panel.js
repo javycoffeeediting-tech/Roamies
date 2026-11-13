@@ -500,8 +500,10 @@
   }
   function appearancePage() {
     return [
+      state.styles ? group('Style', 'How everything around me looks.', null, picks('Style', state.styles, state.style, (x) => act(`style:${x}`), 'style')) : null,
       group('Look', 'Each look has its own name and voice.', null, lookTiles()),
-      group('Size', 'How big I am on your screen.', null, picks('Size', state.sizes, state.size, (x) => act(`size:${x}`), 'size')),
+      group('Size', 'How big I am on your screen.', null, picks('Size', state.sizes, state.size, (x) => act(`size:${x}`), 'size'),
+        state.bubbleOnly != null ? toggle('Bubble only', 'Hide me; just a small text bubble in the top-left corner', state.bubbleOnly, () => act('bubbleonly'), 'bubbleonly') : null),
     ];
   }
   // The looks as live tiles: each one's character, playing, at the size picked below. Kept between renders (a state update mustn't restart
@@ -564,6 +566,8 @@
           if (x === 'voice' && !hasKey) { ui.key = tts; render(`key-${tts}`); note(`Add a ${T} key to hear me talk.`); return; }
           act(`replies:${x}`);
         }, 'replies'),
+        state.voiceSpeeds ? el('div', { className: 'setting' }, el('span', {}, 'Speed', el('small', { textContent: 'How fast I talk. Same voice, same pitch.' }))) : null,
+        state.voiceSpeeds ? picks('Speed', state.voiceSpeeds.map((x) => [String(x), `${x}×`]), String(state.voiceSpeed), (x) => act(`speed:${x}`), 'speed') : null,
         el('p', { className: 'sub', textContent: 'Voice provider' }),
         picks('Voice provider', Object.entries(TTS_NAMES), tts, (x) => {
           if (x !== 'voicestudio' && !state[`${x}Key`]) { ui.key = x; note(`Add a ${TTS_NAMES[x]} key to hear me talk.`); } // its key field opens with it
@@ -605,6 +609,26 @@
   // Wayland: the commands to bind to keys in the desktop's settings (no app may hold its own shortcuts there).
   // A command shows only after copying it failed, so it can be copied by hand.
   const BIND_ROWS = [['talk', 'Talk to me'], ['summon', 'Show or hide me'], ['ask', 'Ask me'], ['list', 'Your list'], ['panel', 'This panel']];
+  // Windows and Linux: a list of words or phrases edited in place (commas between them): the wake phrases, the end
+  // words. Saved on Enter, Save or leaving the field.
+  function wordList({ id, label, hint, words, placeholder, type }) {
+    const now = words.join(', ');
+    const input = el('input', { type: 'text', id, value: now, autocomplete: 'off', spellcheck: false, maxLength: 340,
+      placeholder, 'aria-label': `${label}, separated by commas`, 'data-k': id });
+    const save = () => {
+      const list = input.value.split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+      if (list.join(', ') !== now) send({ type, words: list });
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { save(); input.blur(); } else if (e.key === 'Escape') { e.stopPropagation(); input.value = now; input.blur(); }
+    });
+    input.addEventListener('change', save);
+    return [
+      el('div', { className: 'setting' }, el('span', {}, label, el('small', { textContent: hint }))),
+      el('div', { className: 'keyform' }, el('span', { className: 'px field' }, input), btn('Save', save, { k: `save:${id}` })),
+    ];
+  }
+  const wakePhrases = (words) => wordList({ id: 'wake-words', label: 'Wake phrases', hint: 'Any words you like, commas between. Near-misses count.', words, placeholder: 'Hey Roamies, Hey Jarvis', type: 'panel_wakewords' });
   function behaviorPage() {
     const b = state.bind;
     return [
@@ -612,7 +636,13 @@
         toggle('Sound effects', null, state.sound, () => act('sound'), 'sound'),
         toggle('Allow file edits and commands', 'Change files and run commands', state.actions, () => act('actions'), 'actions'),
         state.voice ? toggle('Auto-listen', state.voice.on ? 'Mic opens when I ask you something.' : 'Needs Voice control on', state.voice.autoListen, () => act('autolisten'), 'autolisten') : null,
-        state.voice?.mac ? toggle('Wake word', state.voice.on ? 'Say “Hey Roamies” to talk. Mic stays on.' : 'Needs Voice control on', state.voice.wakeWord, () => act('wakeword'), 'wakeword') : null,
+        state.voice && (state.voice.wake ?? state.voice.mac) ? toggle('Wake word', state.voice.on ? `Say ${state.voice.wakeSay ?? '“Hey Roamies”'} to talk. Mic stays on.` : 'Needs Voice control on', state.voice.wakeWord, () => act('wakeword'), 'wakeword') : null,
+        state.voice?.wakeWords ? wakePhrases(state.voice.wakeWords) : null,
+        state.voice?.pauseSends != null ? toggle('Send when I pause', state.voice.on ? 'Holding the talk keys, it sends when you stop talking' : 'Needs Voice control on', state.voice.pauseSends, () => act('pausesends'), 'pausesends') : null,
+        state.voice?.endWords ? wordList({ id: 'end-words', label: 'End words', hint: 'Say one last to send at once, e.g. “…, over”.', words: state.voice.endWords, placeholder: 'over, go', type: 'panel_endwords' }) : null,
+        state.voice?.cancelWords ? wordList({ id: 'cancel-words', label: 'Cancel words', hint: 'Say one last to drop it, e.g. “…, never mind”.', words: state.voice.cancelWords, placeholder: 'cancel, never mind', type: 'panel_cancelwords' }) : null,
+        state.history ? toggle('Keep prompt history', `Every request, with the time, in ${state.history.file}`, state.history.on, () => act('history'), 'history') : null,
+        state.autoAllow != null ? toggle('Allow everything', 'Never ask before commands, file edits or using apps', state.autoAllow, () => act('autoallow'), 'autoallow') : null,
         state.login ? toggle('Open at login', null, state.login.on, () => act('login'), 'login') : null),
       b ? group('Shortcuts', 'Add these as custom shortcuts in your keyboard settings, with any keys you like.', null,
         BIND_ROWS.filter(([k]) => b[k]).map(([k, label]) => el('div', { className: 'setting' },
@@ -697,6 +727,7 @@
   // focusKey: what to focus after (a data-k, or an element id); otherwise whatever had focus keeps it.
   function render(focusKey, animate = false) {
     if (!state) return;
+    document.documentElement.dataset.style = state.style === 'modern' ? 'modern' : 'retro';
     const active = document.activeElement;
     // Never rebuild under someone typing a key: catch up when they leave the field.
     if (!focusKey && !animate && active?.tagName === 'INPUT' && active.closest('.pane')) { deferred = true; return; }
@@ -886,7 +917,7 @@
       geminiShared: new URLSearchParams(location.search).has('shared'), geminiModel: 'gemini-3.8-flash-lite-tts',
       geminiModels: [{ id: 'gemini-3.8-flash-lite-tts', name: 'Flash Lite', per10s: 0.0015 }, { id: 'gemini-3.8-flash-tts', name: 'Flash', per10s: 0.00225 }],
       fishModels: [{ id: 'drama-3', name: 'Drama 3', perM: 50, promo: { perM: 10, until: '2026-12-01T08:00:00Z' } }, { id: 's2.1-pro', name: 'S2.1 Pro', perM: 15 }],
-      voice: { on: true, keys: '⌃⌥', ready: true, mac: true, mute: true, wakeWord: false, download: null }, askKeys: '⌥⌘',
+      voice: { on: true, keys: '⌃⌥', ready: true, mac: true, mute: true, wakeWord: false, wake: true, wakeWords: ['Hey Roamies', 'Hey Jarvis'], wakeSay: '“Hey Roamies” or “Hey Jarvis”', pauseSends: false, endWords: ['over', 'go'], cancelWords: ['cancel', 'never mind'], download: null }, voiceSpeed: 1.3, voiceSpeeds: [1, 1.15, 1.3, 1.5, 1.75], bubbleOnly: false, style: 'modern', styles: [['retro', 'Retro'], ['modern', 'Modern']], history: { on: true, file: '~/Roamies/prompt_history.txt' }, autoAllow: false, askKeys: '⌥⌘',
       sound: true, actions: false, login: { on: true },
       update: { available: new URLSearchParams(location.search).has('update') && new URLSearchParams(location.search).get('update') !== 'failed' ? '0.9.1' : null, installing: false, checking: false, result: null },
       intro: false,

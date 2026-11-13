@@ -54,7 +54,12 @@
     return [[x + c, y], [x + w - c, y], [x + w - c, y + s], [x + w - s, y + s], [x + w - s, y + c], [x + w, y + c], [x + w, y + h - c], [x + w - s, y + h - c], [x + w - s, y + h - s], [x + w - c, y + h - s], [x + w - c, y + h],
       [x + c, y + h], [x + c, y + h - s], [x + s, y + h - s], [x + s, y + h - c], [x, y + h - c], [x, y + c], [x + s, y + c], [x + s, y + s], [x + c, y + s], [x + c, y]];
   }
-  const steppedPath = (x, y, w, h, c) => { const p = new Path2D(); stepped(x, y, w, h, c).forEach((q, i) => (i ? p.lineTo(q[0], q[1]) : p.moveTo(q[0], q[1]))); return p; };
+  // Modern style (style.js): the same frames, rounded (glass.js draws the rounded outline).
+  const modern = () => !!R.modern?.() && !!R.glass?.roundPath;
+  const steppedPath = (x, y, w, h, c) => {
+    if (modern()) return R.glass.roundPath(x, y, w, h, Math.max(6, (c ?? 2 * P) * 1.5));
+    const p = new Path2D(); stepped(x, y, w, h, c).forEach((q, i) => (i ? p.lineTo(q[0], q[1]) : p.moveTo(q[0], q[1]))); return p;
+  };
   function catmull(pts, closed) {
     const Q = closed ? [pts[pts.length - 1], ...pts, pts[0], pts[1]] : [pts[0], ...pts, pts[pts.length - 1]], out = [];
     for (let i = 1; i < Q.length - 2; i++) for (let k = 0; k < 10; k++) {
@@ -238,6 +243,14 @@
   // Our chrome for cards and chips: stepped corners, dark glass, an accent edge, a glint along the top.
   function chrome(c, x, y, w, h, o = {}) {
     const path = steppedPath(x, y, w, h, o.corner ?? 2 * P), edge = o.edge || ACC;
+    if (modern()) {
+      c.save();
+      c.fillStyle = o.fill || 'rgba(20,24,30,0.95)'; c.shadowColor = 'rgba(0,0,0,0.38)'; c.shadowBlur = 18; c.shadowOffsetY = 6; c.fill(path);
+      c.shadowColor = 'transparent'; c.shadowBlur = 0; c.shadowOffsetY = 0;
+      c.strokeStyle = o.edge ? rgba(edge, 0.55) : 'rgba(255,255,255,0.13)'; c.lineWidth = 1; c.stroke(path);
+      c.restore();
+      return;
+    }
     c.save();
     c.fillStyle = o.fill || GLASS; c.shadowColor = 'rgba(0,0,0,0.35)'; c.shadowBlur = 14; c.shadowOffsetY = 4; c.fill(path);
     c.shadowColor = rgba(edge, 0.7); c.shadowBlur = 8; c.shadowOffsetY = 0; c.strokeStyle = edge; c.lineWidth = 1.5; c.globalAlpha *= 0.9; c.stroke(path);
@@ -334,9 +347,15 @@
     const u = clamp(age / 0.2, 0, 1), drop = reduced() ? 0 : Math.round((1 - u) * 3) * 3;
     b.save(); b.translate(0, -drop);
     if (o.down) b.translate(0, 2);
-    b.fillStyle = mixHex(fill, '#000000', 0.62); b.fill(steppedPath(x, y + (o.down ? 1 : 3), w, h, P));
-    b.fillStyle = o.hover ? mixHex(fill, '#ffffff', 0.3) : fill; b.fill(steppedPath(x, y, w, h, P));
-    b.fillStyle = 'rgba(255,255,255,0.55)'; b.fillRect(x + P, y + 1, w - 2 * P, 1.5); b.fillStyle = 'rgba(3,39,34,0.25)'; b.fillRect(x + P, y + h - 2.5, w - 2 * P, 1.5);
+    if (modern()) {
+      // A flat rounded pill with a soft shadow, no hard pixel drop.
+      b.save(); b.shadowColor = 'rgba(0,0,0,0.35)'; b.shadowBlur = 8; b.shadowOffsetY = 2;
+      b.fillStyle = o.hover ? mixHex(fill, '#ffffff', 0.25) : fill; b.fill(R.glass.roundPath(x, y, w, h, h / 2)); b.restore();
+    } else {
+      b.fillStyle = mixHex(fill, '#000000', 0.62); b.fill(steppedPath(x, y + (o.down ? 1 : 3), w, h, P));
+      b.fillStyle = o.hover ? mixHex(fill, '#ffffff', 0.3) : fill; b.fill(steppedPath(x, y, w, h, P));
+      b.fillStyle = 'rgba(255,255,255,0.55)'; b.fillRect(x + P, y + 1, w - 2 * P, 1.5); b.fillStyle = 'rgba(3,39,34,0.25)'; b.fillRect(x + P, y + h - 2.5, w - 2 * P, 1.5);
+    }
     typed(b, str, cx, cy, CHIP(k), INKDARK, type, { anchor: 'middle', baseline: 'middle', land: false });
     b.restore();
   }

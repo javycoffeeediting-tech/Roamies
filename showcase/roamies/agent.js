@@ -322,8 +322,9 @@
       const B = R.buddy;
       if (!B) return;
       if (B.onEvent !== onBuddy) B.onEvent = onBuddy;
+      // Bubble only: there's no body to hand over, so the page keeps drawing (the pinned bubble never blinks).
       const ok = B.available() && k.form === 'cursor' && k.presence === 'shown' && !!m.drive && !pen.held && !station.moving
-        && !!self.quiet?.() && !!k.calmBody?.();
+        && !!self.quiet?.() && !!k.calmBody?.() && !R.bubbleOnly;
       nat.ok = ok ? nat.ok + dt : 0;
       if (!ok) {
         if (nat.on || nat.ask) { B.hide(); nat.on = false; nat.ask = 0; m.native = false; }
@@ -386,15 +387,36 @@
       k.appear(entrance(), x, y);
     };
     const MAX_COLS = 38, MAX_LINES = 7, THINK_COLS = 28, THINK_LINES = 1, METER = 7;
-    // Bubble text: Martian Mono (0.7 em per letter), sized to the bubble's line grid.
-    const fontPx = (t) => Math.round(CH * t * 0.64 * 2) / 2;
-    const colW = (t) => fontPx(t) * 0.7 + 0.35;
+    // Bubble text: Martian Mono (0.7 em per letter), sized to the bubble's line grid. Modern style: the system's sans
+    // (style.js), a touch larger, about 0.56 em a letter on average, each letter placed by its measured width.
+    const fontPx = (t) => Math.round(CH * t * 0.64 * (R.modern?.() ? 1.08 : 1) * 2) / 2;
+    const colW = (t) => (R.modern?.() ? fontPx(t) * 0.56 + 0.2 : fontPx(t) * 0.7 + 0.35);
+    // Where each letter of a line starts, in a proportional font (measured once per line and font).
+    const xsCache = new Map();
+    const xsFor = (c, s, font) => {
+      const key = `${font}|${s}`;
+      let xs = xsCache.get(key);
+      if (!xs) {
+        c.font = font; xs = [0];
+        for (let j = 1; j <= s.length; j++) xs.push(c.measureText(s.slice(0, j)).width);
+        if (xsCache.size > 400) xsCache.clear();
+        xsCache.set(key, xs);
+      }
+      return xs;
+    };
     const TEXT_INK = '#dcfff6', TEXT_ACCENT = '#78ffe2';
-    const T = () => clamp(k.P * 0.42, 1.4, 2.4);
+    // Bubble only: smaller type and padding, pinned in the top-left corner (no body for it to come from).
+    const pinned = () => !!R.bubbleOnly;
+    // Pinned, every bubble (listening, thinking, the reply) is the same box in the same spot: PIN_ROWS lines of
+    // MAX_COLS letters, the words scrolling inside it. One that closes keeps its frame up for PIN_HOLD seconds,
+    // so the next one takes over in place instead of the box blinking out and popping back in.
+    const PIN_ROWS = 3, PIN_HOLD = 0.6;
+    const goneAfter = () => (pinned() ? PIN_HOLD + 0.35 : 0.35);
+    const T = () => clamp(k.P * 0.42, 1.4, 2.4) * (pinned() ? 0.72 : 1);
     const G = R.glass;
     // Padding inside a bubble. The thinking tag is slim, one line, with its three dots before the words.
     const DOTS_W = 24;
-    const padX = (bb) => (bb.kind === 'thought' ? 13 : k.P * 3), padY = (bb) => (bb.kind === 'thought' ? 5 : k.P * 3);
+    const padX = (bb) => (pinned() ? k.P * 2 : bb.kind === 'thought' ? 13 : k.P * 3), padY = (bb) => (pinned() ? k.P * 1.6 : bb.kind === 'thought' ? 5 : k.P * 3);
     const dotsDx = (bb) => (bb.kind === 'thought' && bb.text ? DOTS_W + 10 : 0);
     // Under a question: how to answer it.
     const HINT = 'enter to send · esc to skip', HINT_F = `400 11px ${G.MONO}`, HINT_H = 18;
@@ -434,11 +456,14 @@
         const old = b.closed; b.closed = deferred(); b.revealed = deferred(); old.resolve();
         b.pop.v += 4;
       } else {
+        // Pinned: the box is already up (or still holding after closing), so the new bubble takes it over at once.
+        const swap = pinned() && (!!b || dying.length > 0);
         if (b) close(b);
+        if (swap) { for (const d of dying.splice(0)) d.closed.resolve(); }
         b = make(kind);
         const tip = tipPoint();
         b.x.x = tip.x - k.P * 4; b.y.x = tip.y - k.P * 6; b.tail.x.x = tip.x; b.tail.y.x = tip.y;
-        k.S('pop');
+        if (swap) b.instant = true; else k.S('pop');
       }
       b.mood = opts.mood ?? null;
       // point: hand target in body radii (e.g. [0.3, -1.6] points up) held while the bubble is open.
@@ -463,6 +488,11 @@
     // ---- layout targets ----
     const innerSize = (bb) => {
       const t = T();
+      if (pinned() && !bb.expanded) {
+        // The same size whatever it holds; only a question's buttons or hint add a row under it.
+        const rows = clamp(bb.lines.filter((l) => l.start < Math.max(1, bb.shown) || l === bb.lines[0]).length, 1, PIN_ROWS);
+        return { cols: MAX_COLS, rows: PIN_ROWS, shownRows: rows, maxRows: PIN_ROWS, w: MAX_COLS * colW(t), h: PIN_ROWS * CH * t + (bb.input ? footH(bb) : 0) };
+      }
       if (bb.kind === 'thought' && !bb.text) return { cols: 4, rows: 1, w: DOTS_W + 6, h: CH * t };
       const maxCols = bb.kind === 'thought' ? THINK_COLS : bb.expanded ? Math.min(72, Math.floor((W - 80) / colW(t))) : MAX_COLS;
       const maxRows = bb.kind === 'thought' ? THINK_LINES : bb.expanded ? Math.max(MAX_LINES, Math.floor((H * 0.62) / (CH * t))) : MAX_LINES;
@@ -515,8 +545,13 @@
       // Input bubbles track their text tightly (near-critical damping) so new lines never outrun the frame. Speech
       // grows critically damped too: an overshoot as each line arrives bobbed the text up and down mid-read.
       const [sk, sc] = bb.input ? [460, 42] : [190, 28];
-      spring(bb.w, tw, sk, sc, dt); spring(bb.h, thh, sk, sc, dt);
-      spring(bb.pop, bb.closing ? 0 : 1, 240, 15, dt);
+      if (pinned() && !bb.expanded) {
+        bb.w.x = tw; bb.h.x = thh; bb.w.v = bb.h.v = 0;
+        bb.pop.x = 1; bb.pop.v = 0; // no pop or bounce: it fades in and out where it is
+      } else {
+        spring(bb.w, tw, sk, sc, dt); spring(bb.h, thh, sk, sc, dt);
+        spring(bb.pop, bb.closing ? 0 : 1, 240, 15, dt);
+      }
       spring(bb.cloud, bb.kind === 'thought' ? 1 : 0, 120, 13, dt);
       // scroll: follow the newest line while speaking
       const totalLines = bb.lines.filter((l) => l.start <= bb.shown).length;
@@ -525,8 +560,10 @@
       // Typing: keep the caret's line in view, wherever it's been moved to.
       if (bb.input && !bb.input.listen && bb.text) { const { li } = caretAt(bb.lines, bb.input.caret ?? bb.text.length); bb.scrollTarget = clamp(bb.scrollTarget ?? 0, li - inner.rows + 1, li); }
       bb.scrollTarget = clamp(bb.scrollTarget ?? 0, 0, Math.max(0, bb.lines.length - inner.rows));
-      spring(bb.scroll, bb.scrollTarget, bb.input ? 300 : 120, bb.input ? 34 : 18, dt);
-      bb.overflow = bb.lines.length > inner.rows;
+      // Pinned: critically damped, so a new line slides the words up once with no bounce.
+      if (pinned()) spring(bb.scroll, bb.scrollTarget, 120, 2 * Math.sqrt(120), dt);
+      else spring(bb.scroll, bb.scrollTarget, bb.input ? 300 : 120, bb.input ? 34 : 18, dt);
+      bb.overflow = bb.lines.length > inner.rows && !(pinned() && inner.shownRows < PIN_ROWS && !bb.expanded);
       bb.rows = inner.rows; bb.cols = inner.cols;
       // Placement: above the head, else below, else beside; always fully inside the visible screen.
       // The thinking tag sits where the reply will open, so it turns into the reply without moving.
@@ -559,21 +596,23 @@
       // Keep the current side while it still fits, so the bubble doesn't flicker between sides; it changes only
       // when it would run off the screen. Pushed off its first choice by an edge, it goes back once there's clear
       // room again (not the moment it just fits, which flickered at the edge).
-      if (!bb.side || bb.order !== order[0] || !fits(bb.side, P * 2)) {
+      if (pinned()) bb.side = 'below';
+      else if (!bb.side || bb.order !== order[0] || !fits(bb.side, P * 2)) {
         bb.order = order[0];
         bb.side = order.find((sd) => fits(sd)) ?? (m.y - T0 > B0 - m.y ? 'above' : 'below');
       } else if (bb.side !== order[0] && fits(order[0], -P * 6)) bb.side = order[0];
       bb.below = bb.side === 'below';
-      const tgt = place[bb.side], maxX = Math.max(L0, R0 - w), maxY = Math.max(T0, B0 - h);
+      const tgt = pinned() ? { x: L0, y: T0 } : place[bb.side], maxX = Math.max(L0, R0 - w), maxY = Math.max(T0, B0 - h);
       // Following the cursor: carry the bubble along with the body exactly, so it can't trail or wobble.
-      if (m.drive && bb.mx != null) {
+      if (m.drive && bb.mx != null && !pinned()) {
         const ddx = m.x - bb.mx, ddy = m.y - bb.my;
         bb.x.x += ddx; bb.y.x += ddy; bb.tail.x.x += ddx; bb.tail.y.x += ddy;
       }
       bb.mx = m.x; bb.my = m.y;
       // It opens where it belongs (its pop-in is the entrance), rather than sliding there and overshooting.
       if (!bb.placed) { bb.placed = true; bb.x.x = clamp(tgt.x, L0, maxX); bb.y.x = clamp(tgt.y, T0, maxY); bb.x.v = bb.y.v = 0; }
-      spring(bb.x, clamp(tgt.x, L0, maxX), 70, 17, dt); spring(bb.y, clamp(tgt.y, T0, maxY), 70, 17, dt);
+      if (pinned()) { bb.x.x = L0; bb.y.x = T0; bb.x.v = bb.y.v = 0; } // nailed to the corner, every frame
+      else { spring(bb.x, clamp(tgt.x, L0, maxX), 70, 17, dt); spring(bb.y, clamp(tgt.y, T0, maxY), 70, 17, dt); }
       // Hard clamp after the spring: lag or overshoot must never push it past the edge.
       bb.x.x = clamp(bb.x.x, L0, maxX); bb.y.x = clamp(bb.y.x, T0, maxY);
       const beside = bb.side === 'left' || bb.side === 'right';
@@ -595,22 +634,23 @@
     // ---- bubbles: the card look, with a stepped tail to the body (or, thinking, two little steps up from it) ----
     // The frame as drawn this instant: it pops in and out around the point its tail comes from.
     const bubbleBox = (bb) => {
-      const pop = clamp(bb.pop.x, 0, 1.08), beside = bb.side === 'left' || bb.side === 'right';
-      const ax = beside ? (bb.side === 'right' ? bb.x.x : bb.x.x + bb.w.x) : bb.tail.x.x;
-      const ay = beside ? clamp(bb.tail.y.x, bb.y.x, bb.y.x + bb.h.x) : bb.below ? bb.y.x : bb.y.x + bb.h.x;
+      const pop = clamp(bb.pop.x, 0, 1.08), beside = bb.side === 'left' || bb.side === 'right', pin = pinned();
+      // Pinned, it pops out of its corner.
+      const ax = pin ? bb.x.x : beside ? (bb.side === 'right' ? bb.x.x : bb.x.x + bb.w.x) : bb.tail.x.x;
+      const ay = pin ? bb.y.x : beside ? clamp(bb.tail.y.x, bb.y.x, bb.y.x + bb.h.x) : bb.below ? bb.y.x : bb.y.x + bb.h.x;
       const X = (v) => ax + (v - ax) * pop, Y = (v) => ay + (v - ay) * pop, x = X(bb.x.x), y = Y(bb.y.x);
       return { x, y, w: X(bb.x.x + bb.w.x) - x, h: Y(bb.y.x + bb.h.x) - y };
     };
     const TAIL_SIDE = { above: 'bottom', below: 'top', right: 'left', left: 'right' };
     const drawBubble = (ctx, bb) => {
-      const fade = bb.closing ? clamp(1 - bb.closing / 0.3, 0, 1) : clamp(bb.age / 0.22, 0, 1);
+      const fade = bb.closing ? clamp(1 - Math.max(0, bb.closing - (pinned() ? PIN_HOLD : 0)) / 0.3, 0, 1) : bb.instant ? 1 : clamp(bb.age / 0.22, 0, 1);
       const f = (bb.frame = bubbleBox(bb));
       if (fade <= 0 || f.w < 12 || f.h < 10) return;
       const P = k.P, tip = [bb.tail.x.x, bb.tail.y.x], side = TAIL_SIDE[bb.side] ?? 'bottom', across = side === 'top' || side === 'bottom';
-      const speechTail = 1 - bb.cloud.x;
+      const speechTail = pinned() ? 0 : 1 - bb.cloud.x;
       ctx.save();
       ctx.globalAlpha *= fade;
-      if (bb.cloud.x > 0.05) {
+      if (bb.cloud.x > 0.05 && !pinned()) {
         const base = across ? [clamp(tip[0], f.x + 12, f.x + f.w - 12), side === 'top' ? f.y : f.y + f.h] : [side === 'left' ? f.x : f.x + f.w, clamp(tip[1], f.y + 8, f.y + f.h - 8)];
         [[0.32, 8], [0.7, 5]].forEach(([u, sz], i) => {
           if (bb.trail < i * 0.3) return;
@@ -639,7 +679,7 @@
         }
       }
       // Listening: the voice level as thin glowing bars under the transcript, a sweep while it's finished off.
-      if (bb.input?.listen) {
+      if (bb.input?.listen && !pinned()) {
         const inp = bb.input, mh = METER * P, x0 = f.x + padX(bb), x1 = f.x + f.w - padX(bb), bot = f.y + f.h - padY(bb);
         const n = Math.max(1, Math.floor((x1 - x0) / 5));
         while (inp.levels.length < n) inp.levels.unshift(0);
@@ -717,6 +757,7 @@
       };
       let curFont = '';
       tctx.textBaseline = 'middle'; tctx.textAlign = 'left';
+      const mod = !!R.modern?.();
       const ink = dim ? css(PAL[L - 2], 0.9) : TEXT_INK, accent = dim ? ink : TEXT_ACCENT;
       for (let li = first; li <= last; li++) {
         const line = lines[li], cy = (li - s0 + 0.5) * lh;
@@ -724,12 +765,15 @@
         const edge = Math.min(1, fadeTop ? (cy / lh) * 1.2 : 1, fadeBot ? ((ih - cy) / lh) * 1.2 : 1);
         if (edge <= 0.02) continue;
         tctx.globalAlpha = clamp(edge, 0, 1);
+        const xs = mod ? xsFor(tctx, line.s, fontFor(0)) : null;
+        if (xs) curFont = fontFor(0);
+        const colX = (j) => (xs ? xs[j] : j * cw);
         for (let j = 0; j < line.s.length; j++) {
           const idx = line.start + j;
           if (idx >= shown) break;
           if (line.s[j] === ' ') {
             // A link's underline runs on under the spaces between its words.
-            if (R.md && (bb.sty?.[idx] ?? 0) & R.md.LINK && (bb.sty?.[idx + 1] ?? 0) & R.md.LINK) { tctx.fillStyle = TEXT_ACCENT; tctx.fillRect(j * cw, cy + lh * 0.36, cw, Math.max(1, t * 0.4)); }
+            if (R.md && (bb.sty?.[idx] ?? 0) & R.md.LINK && (bb.sty?.[idx + 1] ?? 0) & R.md.LINK) { tctx.fillStyle = TEXT_ACCENT; tctx.fillRect(colX(j), cy + lh * 0.36, colX(j + 1) - colX(j), Math.max(1, t * 0.4)); }
             continue;
           }
           const em = emojiAt(line.s, j);
@@ -738,11 +782,11 @@
           // in place: a little hop per letter made the line being read shake while it streamed in.
           const st = ph ? 0 : bb.sty?.[idx] ?? 0, f = fontFor(st);
           if (f !== curFont) { tctx.font = f; curFont = f; }
-          const age = ph ? 9 : now - (bb.at[idx] ?? 0), x = j * cw + (em ? cw * 0.15 : 0), y = cy;
+          const age = ph ? 9 : now - (bb.at[idx] ?? 0), x = colX(j) + (em && !xs ? cw * 0.15 : 0), y = cy;
           const marked = md && st & (md.CODE | md.LINK);
           tctx.fillStyle = age < 0.12 ? '#ffffff' : marked ? accent : ink;
           tctx.fillText(ch, x, y);
-          if (md && st & md.LINK) tctx.fillRect(x, cy + lh * 0.36, cw, Math.max(1, t * 0.4));
+          if (md && st & md.LINK) tctx.fillRect(x, cy + lh * 0.36, xs ? colX(j + (em ? em.n : 1)) - colX(j) : cw, Math.max(1, t * 0.4));
           if (em) j += em.n - 1;
         }
       }
@@ -753,7 +797,9 @@
         if (bb.text) ({ li, col } = caretAt(bb.lines, bb.input.caret ?? bb.text.length));
         if (col >= bb.cols) col = bb.cols - 1;
         const cy = (li - s0) * lh;
-        if (cy > -1 && cy < ih) { tctx.fillStyle = css(HOT); tctx.fillRect(col * cw + 0.5, cy + lh * 0.15, Math.max(1.5, t * 0.8), lh * 0.7); }
+        const cx = mod && bb.lines[li] ? xsFor(tctx, bb.lines[li].s, fontFor(0))[Math.min(col, bb.lines[li].s.length)] : col * cw;
+        if (mod) curFont = fontFor(0);
+        if (cy > -1 && cy < ih) { tctx.fillStyle = css(HOT); tctx.fillRect(cx + 0.5, cy + lh * 0.15, Math.max(1.5, t * 0.8), lh * 0.7); }
       }
       // Clip to the frame as it is this instant: it may still be growing, or shrinking away on close.
       const cx1 = fr.x + fr.w - padX(bb) + 2, cy1 = fr.y + fr.h - padY(bb) - (bb.input?.listen ? (METER + 1) * P : 0) - footH(bb) + 2;
@@ -1167,7 +1213,7 @@
         }
         if (!onStage) {
           // Bubbles closed by hide() still need to finish dissolving (unseen) so their promises settle.
-          for (let i = dying.length - 1; i >= 0; i--) { dying[i].closing += dt; if (dying[i].closing > 0.35) { dying[i].closed.resolve(); dying.splice(i, 1); } }
+          for (let i = dying.length - 1; i >= 0; i--) { dying[i].closing += dt; if (dying[i].closing > goneAfter()) { dying[i].closed.resolve(); dying.splice(i, 1); } }
           return;
         }
         mouthT -= dt;
@@ -1245,7 +1291,7 @@
         }
         for (let i = dying.length - 1; i >= 0; i--) {
           step(dying[i], dt, env);
-          if (dying[i].closing > 0.35) { dying[i].closed.resolve(); dying.splice(i, 1); }
+          if (dying[i].closing > goneAfter()) { dying[i].closed.resolve(); dying.splice(i, 1); }
         }
       },
       gridOver: () => {},
@@ -1254,12 +1300,18 @@
         if (!stage()) return null;
         let e = null;
         const add = (x0, y0, x1, y1) => { e = e ? [Math.min(e[0], x0), Math.min(e[1], y0), Math.max(e[2], x1), Math.max(e[3], y1)] : [x0, y0, x1, y1]; };
-        for (const bb of [b, ...dying]) if (bb) { add(bb.x.x - 8, bb.y.x - 8, bb.x.x + bb.w.x * 1.08 + 8, bb.y.x + bb.h.x * 1.08 + 8); add(bb.tail.x.x - 8, bb.tail.y.x - 8, bb.tail.x.x + 8, bb.tail.y.x + 8); }
-        if (tool) { const g = tagBox(tool); add(g.x, g.y - 10, g.x + g.w, g.y + g.h); }
+        for (const bb of [b, ...dying]) {
+          if (!bb) continue;
+          // Pinned: just its fixed box, so the drawn area (and the canvas) never changes under it.
+          if (pinned() && !bb.expanded) { add(bb.x.x - 8, bb.y.x - 8, bb.x.x + bb.w.x + 8, bb.y.x + bb.h.x + 8); continue; }
+          add(bb.x.x - 8, bb.y.x - 8, bb.x.x + bb.w.x * 1.08 + 8, bb.y.x + bb.h.x * 1.08 + 8); add(bb.tail.x.x - 8, bb.tail.y.x - 8, bb.tail.x.x + 8, bb.tail.y.x + 8);
+        }
+        if (tool && !pinned()) { const g = tagBox(tool); add(g.x, g.y - 10, g.x + g.w, g.y + g.h); }
         return e;
       },
       // The body is drawn snapped to its grid cell while it follows (10-dither.js): bubbles riding with it move too.
       shift: (dx, dy) => {
+        if (pinned()) return; // pinned bubbles don't ride with the (hidden) body
         for (const bb of [b, ...dying]) {
           if (!bb) continue;
           bb.x.x += dx; bb.y.x += dy; bb.tail.x.x += dx; bb.tail.y.x += dy;
@@ -1273,7 +1325,7 @@
         if (!stage()) return;
         // The tag goes under every bubble, so it can never cover the words or the Allow and Don't allow buttons of the
         // open one, nor sit on one that's fading out (the tag takes its usual spot back as soon as a bubble closes).
-        if (tool) drawTag(ctx, tool);
+        if (tool && !pinned()) drawTag(ctx, tool);
         for (const bb of dying) { drawBubble(ctx, bb); drawText(ctx, env, bb); }
         if (b) { drawBubble(ctx, b); drawText(ctx, env, b); }
       },
